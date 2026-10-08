@@ -3,8 +3,9 @@
  *
  * Read-only tools and edits to ordinary files inside the working directory run as-is.
  * Every other call (bash, edits elsewhere, MCP and custom tools) goes to a reviewer model first.
- * Calls it allows run without a prompt, and so do denials it rates low or medium in T3 Code's full access.
- * The rest, and calls on this extension's own files, go to a human, or are blocked when no UI exists.
+ * Calls it allows run without a prompt. The rest, and calls on this extension's own files, go to a human,
+ * or are blocked when no UI exists. In T3 Code this replaces the bridge's own prompts, except in full access,
+ * where nothing waits: calls run at once, and critical findings and calls on this extension's files are shown after.
  */
 
 import { homedir } from "node:os";
@@ -63,8 +64,9 @@ Deny when any of these applies and the user did not ask for that specific action
 When the user explicitly asked for this exact action, allow it unless it sends secrets to a destination the
 user did not name. A broad goal ("clean up", "fix the build") does not authorize a destructive step by itself.
 
-Rate risk "high" or "critical" when the call matches the list above, and "medium" or "low" when you deny only
-because you are unsure the user wants it.
+Rate risk "critical" when the call matches the list above and the harm would be severe and lasting: data or
+resources lost for good, secrets or private data sent out, production systems changed, or security weakened.
+Rate other matches "high", and "medium" or "low" when you deny only because you are unsure the user wants it.
 
 Reply with one JSON object and nothing else:
 {"outcome":"allow"|"deny","risk":"low"|"medium"|"high"|"critical","reason":"<one sentence, in the user's language>"}`;
@@ -128,12 +130,6 @@ export function parseVerdict(text: string): Verdict | undefined {
 	}
 }
 
-/** Whether a verdict goes to a human. Full access in T3 Code asked for few prompts, so there only high risks and failed reviews do. */
-export function needsHuman(verdict: Verdict, t3Mode: string | undefined): boolean {
-	if (verdict.outcome === "allow") return false;
-	return t3Mode !== "full-access" || (verdict.risk !== "low" && verdict.risk !== "medium");
-}
-
 function userMessages(ctx: ExtensionContext): string[] {
 	const texts: string[] = [];
 	for (const entry of ctx.sessionManager.getBranch()) {
@@ -149,6 +145,9 @@ function userMessages(ctx: ExtensionContext): string[] {
 function unreviewed(reason: string): Verdict {
 	return { outcome: "deny", risk: "unknown", reason };
 }
+
+/** Calls on this extension's own files skip the reviewer, so the agent cannot talk it into them. */
+const SELF_VERDICT = unreviewed("Calls on pi-auto-review's own files are never left to the reviewer.");
 
 function reviewerModel(ctx: ExtensionContext) {
 	const spec = process.env.PI_AUTO_REVIEW_MODEL;
@@ -192,27 +191,47 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 }
 
 export default function autoReview(pi: ExtensionAPI) {
-	pi.on("tool_call", async (event, ctx) => {
-		// T3 Code asks a human itself in every mode except full access; reviewing too would only add latency.
-		const t3Mode = process.env.T3_PI_RUNTIME_MODE;
-		if (t3Mode !== undefined && t3Mode !== "full-access") return;
+	// Outside full access, T3 Code's bridge asks about every call itself; the reviewer takes that over. The bridge
+	// reads an unset mode as full access, and child processes then see plain pi, which still reviews.
+	// ponytail: relies on the bridge rereading the mode on every call; if it stops, its prompts come back on top of ours.
+	const t3Mode = process.env.T3_PI_RUNTIME_MODE;
+	const fullAccess = t3Mode === "full-access";
+	if (t3Mode !== undefined && !fullAccess) {
+		delete process.env.T3_PI_RUNTIME_MODE;
+		// Hand the prompts back as this runtime goes away; if the next load fails, the bridge asks again.
+		pi.on("session_shutdown", () => {
+			process.env.T3_PI_RUNTIME_MODE = t3Mode;
+		});
+	}
 
+	pi.on("tool_call", async (event, ctx) => {
 		const self = touches(SELF_DIR, event.toolName, event.input, ctx.cwd);
 		const readOnlyHint = pi.getAllTools().find((tool) => tool.name === event.toolName)?.annotations?.readOnlyHint;
 		if (!self && !needsReview(event.toolName, event.input, ctx.cwd, readOnlyHint)) return;
 
-		const verdict = self ? unreviewed("Calls on pi-auto-review's own files always need a human.") : await review(ctx, event.toolName, event.input);
-		if (!self && !needsHuman(verdict, t3Mode)) return;
+		const why = (verdict: Verdict) => `pi-auto-review (${verdict.risk}): ${verdict.reason}`;
+		const details = clip(JSON.stringify(event.input, null, 2));
+		if (fullAccess) {
+			// Full access asked for no prompts: the call runs now, and only a self call or a critical finding is shown.
+			// ponytail: T3 Code drops a notice that arrives after the turn ends, and a failed review shows nothing.
+			void (async () => {
+				const verdict = self ? SELF_VERDICT : await review(ctx, event.toolName, event.input);
+				if (self || verdict.risk === "critical") ctx.ui.notify(`${why(verdict)} ${event.toolName} ran anyway.\n\n${details}`, "warning");
+			})().catch(() => {}); // the session may be gone by then
+			return;
+		}
 
-		const why = `pi-auto-review (${verdict.risk}): ${verdict.reason}`;
+		const verdict = self ? SELF_VERDICT : await review(ctx, event.toolName, event.input);
+		if (verdict.outcome === "allow") return;
+
 		const noRetry = "Do not retry it in another form to get around this.";
 		if (!ctx.hasUI) {
 			// Without a reviewer, a user's approval in chat cannot unlock a self call; only an interactive session can.
 			const next = self ? "Ask the user to make this change in an interactive session." : "Ask the user to approve this action explicitly.";
-			return { block: true, reason: `${why} pi-auto-review stopped it, not the user. ${noRetry} ${next}` };
+			return { block: true, reason: `${why(verdict)} pi-auto-review stopped it, not the user. ${noRetry} ${next}` };
 		}
 		// T3 Code reads the tool name from this exact title to label the approval.
-		const approved = await ctx.ui.confirm(`Allow ${event.toolName}?`, `${why}\n\n${clip(JSON.stringify(event.input, null, 2))}`);
-		if (!approved) return { block: true, reason: `${event.toolName} was declined by the user. ${noRetry} ${why}` };
+		const approved = await ctx.ui.confirm(`Allow ${event.toolName}?`, `${why(verdict)}\n\n${details}`);
+		if (!approved) return { block: true, reason: `${event.toolName} was declined by the user. ${noRetry} ${why(verdict)}` };
 	});
 }
