@@ -55,6 +55,8 @@ test("touches catches calls on the extension's own files", () => {
 	assert.equal(touches(self, "bash", { command: `sed -i '' s/a/b/ ${self}/index.ts` }, cwd), true);
 	assert.equal(touches(self, "bash", { command: "cd ~/ext/pi-auto-review && sed -i '' s/a/b/ index.ts" }, cwd), true);
 	assert.equal(touches(self, "bash", { command: "npm test" }, cwd), false);
+	const win = "C:\\Users\\alice\\ext\\pi-auto-review";
+	assert.equal(touches(win, "bash", { command: `printf x > "${win}\\index.ts"` }, "C:\\work"), true);
 	assert.equal(touches(self, "read", { path: `${self}/index.ts` }, cwd), false);
 });
 

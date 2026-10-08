@@ -108,7 +108,9 @@ export function touches(dir: string, toolName: string, input: Record<string, unk
 	if (FILE_TOOLS.has(toolName) && typeof input.path === "string") return inside(dir, resolveToolPath(cwd, input.path));
 	// ponytail: lexical, a relative path or a variable hides dir; the reviewer still sees those calls.
 	const text = JSON.stringify(input);
-	return text.includes(dir) || text.includes(dir.replace(homedir(), "~"));
+	// Strings in text are JSON-escaped (a Windows \ is \\ there), so escape the names the same way.
+	const names = (name: string) => text.includes(JSON.stringify(name).slice(1, -1));
+	return names(dir) || names(dir.replace(homedir(), "~"));
 }
 
 export function parseVerdict(text: string): Verdict | undefined {
