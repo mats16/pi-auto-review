@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { homedir } from "node:os";
-import { needsHuman, needsReview, parseVerdict, touches } from "./index.ts";
+import autoReview, { needsReview, parseVerdict, touches } from "./index.ts";
 
 const cwd = "/work/project";
 
@@ -60,12 +60,48 @@ test("touches catches calls on the extension's own files", () => {
 	assert.equal(touches(self, "read", { path: `${self}/index.ts` }, cwd), false);
 });
 
-test("needsHuman lets full access skip low and medium denials only", () => {
-	const deny = (risk: string) => ({ outcome: "deny" as const, risk, reason: "" });
-	assert.equal(needsHuman({ outcome: "allow", risk: "low", reason: "" }, undefined), false);
-	assert.equal(needsHuman(deny("medium"), "full-access"), false);
-	assert.equal(needsHuman(deny("low"), "full-access"), false);
-	assert.equal(needsHuman(deny("high"), "full-access"), true);
-	assert.equal(needsHuman(deny("unknown"), "full-access"), true);
-	assert.equal(needsHuman(deny("medium"), undefined), true);
+/** Loads the extension as T3 Code would start pi in the given mode. */
+function load(mode: string | undefined): Record<string, any> {
+	if (mode === undefined) delete process.env.T3_PI_RUNTIME_MODE;
+	else process.env.T3_PI_RUNTIME_MODE = mode;
+	const handlers: Record<string, any> = {};
+	autoReview({ on: (event: string, handler: any) => (handlers[event] = handler), getAllTools: () => [] } as any);
+	return handlers;
+}
+
+/** Runs one bash call under a T3 mode, with a reviewer that denies at the given risk. */
+async function runCall(mode: string | undefined, risk: string, command = "x") {
+	const handlers = load(mode);
+	const text = JSON.stringify({ outcome: "deny", risk, reason: "r" });
+	const seen: string[] = [];
+	const ctx = {
+		cwd,
+		hasUI: true,
+		model: {},
+		sessionManager: { getBranch: () => [] },
+		modelRegistry: { complete: async () => (seen.push("review"), { stopReason: "stop", content: [{ type: "text", text }] }) },
+		ui: { confirm: async () => (seen.push("confirm"), false), notify: () => seen.push("notify") },
+	};
+	const result = await handlers.tool_call({ toolName: "bash", input: { command } }, ctx);
+	await new Promise((resolve) => setImmediate(resolve));
+	return { blocked: result?.block === true, seen, mode: process.env.T3_PI_RUNTIME_MODE };
+}
+
+test("outside full access, the reviewer replaces T3's prompts and asks on denials", async () => {
+	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
+	assert.deepEqual(await runCall("auto-accept-edits", "low"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
+});
+
+test("a reload hands T3's prompts back until the extension loads again", async () => {
+	const handlers = load("approval-required");
+	assert.equal(process.env.T3_PI_RUNTIME_MODE, undefined);
+	await handlers.session_shutdown({ type: "session_shutdown", reason: "reload" });
+	assert.equal(process.env.T3_PI_RUNTIME_MODE, "approval-required");
+	assert.equal(load(undefined).session_shutdown, undefined); // plain pi has no T3 mode to hand back
+});
+
+test("full access never waits and shows only critical findings and self calls", async () => {
+	assert.deepEqual(await runCall("full-access", "critical"), { blocked: false, seen: ["review", "notify"], mode: "full-access" });
+	assert.deepEqual(await runCall("full-access", "high"), { blocked: false, seen: ["review"], mode: "full-access" });
+	assert.deepEqual(await runCall("full-access", "low", `cat ${import.meta.dirname}/index.ts`), { blocked: false, seen: ["notify"], mode: "full-access" });
 });
