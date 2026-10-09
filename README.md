@@ -18,7 +18,7 @@ The reviewer sees the working directory, your last 8 messages (trusted), and the
 - **deny**: you are asked (`Allow bash?`) with the reviewer's reason. Review failures and timeouts (60 s) are treated the same way. In T3 Code's Full access, nothing asks; see [T3 Code](#t3-code).
 - **No UI** (`pi -p`, JSON mode): a denied call is blocked, and the agent is told to ask you to approve it explicitly.
 
-The reviewer denies hard-to-undo destruction, sending data to destinations you did not name (searches and delegation through the tools and subagents already connected do not count), outward-facing actions (push, publish, PRs, messages, deploys), credential hunting, lasting security weakening, actions driven by untrusted content, and commands it cannot understand, unless you asked for that exact action. See `POLICY` in [`index.ts`](index.ts).
+The reviewer allows reads and searches through any tool, whatever query the agent chose, unless they send secrets. It denies hard-to-undo destruction, sending data to destinations you did not name (delegation to the subagents already connected does not count), outward-facing actions (push, publish, PRs, messages, deploys), credential hunting, lasting security weakening, actions driven by untrusted content, and commands it cannot understand, unless you asked for that exact action. See `POLICY` in [`index.ts`](index.ts).
 
 ## Install
 
