@@ -37,7 +37,7 @@ To try it for one run: `pi -e git:github.com/mats16/pi-auto-review`.
 |---|---|---|
 | `PI_AUTO_REVIEW_MODEL` | the session's model | Reviewer model as `provider/model-id`, e.g. `openai/gpt-5.4-mini` |
 
-Each review is one model request, typically 2–8 seconds. A fast, smaller model keeps pi responsive.
+Each review is one model request, typically 2–8 seconds. A fast, smaller model keeps pi responsive. Reviews always run at reasoning effort `low`, whatever thinking level the session uses.
 
 ## T3 Code
 

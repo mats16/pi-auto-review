@@ -20,6 +20,7 @@ const SELF_DIR = dirname(fileURLToPath(import.meta.url));
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const FILE_TOOLS = new Set(["edit", "write"]);
 const TIMEOUT_MS = 60_000;
+const REASONING = "low";
 const MAX_USER_MESSAGES = 8;
 const MAX_CHARS = 4_000;
 
@@ -192,11 +193,14 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 	const timeout = AbortSignal.timeout(TIMEOUT_MS);
 	const signal = ctx.signal ? AbortSignal.any([timeout, ctx.signal]) : timeout;
 	try {
-		const response = await ctx.modelRegistry.complete(
-			model,
-			{ systemPrompt: POLICY, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-			{ signal },
-		);
+		// Pin the effort: left unset, each provider picks its own, and some GPT models then do no reasoning at all.
+		const response = await ctx.modelRegistry
+			.streamSimple(
+				model,
+				{ systemPrompt: POLICY, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
+				{ reasoning: REASONING, signal },
+			)
+			.result();
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
 			return unreviewed(`Review failed: ${response.errorMessage ?? response.stopReason}`);
 		}

@@ -78,14 +78,18 @@ function load(mode: string | undefined): Record<string, any> {
 	return handlers;
 }
 
-/** A session whose reviewer replies with text; seen records each review, confirm and notify. */
+/** A session whose reviewer replies with text; seen records each review (with its reasoning effort), confirm and notify. */
 function fakeCtx(text: string, seen: string[], hasUI = true) {
 	return {
 		cwd,
 		hasUI,
 		model: {},
 		sessionManager: { getBranch: () => [] },
-		modelRegistry: { complete: async () => (seen.push("review"), { stopReason: "stop", content: [{ type: "text", text }] }) },
+		modelRegistry: {
+			streamSimple: (_model: unknown, _context: unknown, options: { reasoning?: string }) => ({
+				result: async () => (seen.push(`review:${options.reasoning}`), { stopReason: "stop", content: [{ type: "text", text }] }),
+			}),
+		},
 		ui: { confirm: async () => (seen.push("confirm"), false), notify: () => seen.push("notify") },
 	};
 }
@@ -101,9 +105,9 @@ async function runCall(mode: string | undefined, risk: string, command = "x") {
 }
 
 test("outside full access, the reviewer replaces T3's prompts: high and unrated denials ask, a medium one runs", async () => {
-	assert.deepEqual(await runCall("approval-required", "high"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
-	assert.deepEqual(await runCall("auto-accept-edits", "unknown"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
-	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: false, seen: ["review"], mode: undefined });
+	assert.deepEqual(await runCall("approval-required", "high"), { blocked: true, seen: ["review:low", "confirm"], mode: undefined });
+	assert.deepEqual(await runCall("auto-accept-edits", "unknown"), { blocked: true, seen: ["review:low", "confirm"], mode: undefined });
+	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: false, seen: ["review:low"], mode: undefined });
 });
 
 test("without a UI, a call that approval in chat cannot unlock is sent to an interactive session", async () => {
@@ -128,7 +132,7 @@ test("a reload hands T3's prompts back until the extension loads again", async (
 });
 
 test("full access never waits and shows only critical findings and self calls", async () => {
-	assert.deepEqual(await runCall("full-access", "critical"), { blocked: false, seen: ["review", "notify"], mode: "full-access" });
-	assert.deepEqual(await runCall("full-access", "high"), { blocked: false, seen: ["review"], mode: "full-access" });
+	assert.deepEqual(await runCall("full-access", "critical"), { blocked: false, seen: ["review:low", "notify"], mode: "full-access" });
+	assert.deepEqual(await runCall("full-access", "high"), { blocked: false, seen: ["review:low"], mode: "full-access" });
 	assert.deepEqual(await runCall("full-access", "low", `cat ${import.meta.dirname}/index.ts`), { blocked: false, seen: ["notify"], mode: "full-access" });
 });
