@@ -49,7 +49,7 @@ test("parseVerdict rejects anything it cannot trust", () => {
 test("parseVerdict derives the outcome from the risk, as Codex's auto-review does", () => {
 	assert.equal(parseVerdict('{"outcome":"deny","risk":"medium","reason":"not asked for"}')?.outcome, "allow");
 	assert.equal(parseVerdict('{"outcome":"deny","risk":"Low","reason":"x"}')?.outcome, "allow");
-	// High keeps the reviewer's call: it runs only when the user asked for that exact action.
+	// High keeps the reviewer's call: it runs only when it carries out what the user asked for.
 	assert.equal(parseVerdict('{"outcome":"deny","risk":"high","reason":"x"}')?.outcome, "deny");
 	assert.equal(parseVerdict('{"outcome":"allow","risk":"high","reason":"the user asked for this push"}')?.outcome, "allow");
 });
