@@ -19,9 +19,9 @@ Like Codex's auto-review, the reviewer rates each call's risk by what the call c
 - **low**, **medium**: the call runs without a prompt, even a step you did not ask for.
 - **high**: runs if you asked for this exact action; otherwise you are asked (`Allow bash?`) with the reviewer's reason.
 - **critical**: you are asked. Review failures, timeouts (60 s), and denials without a rating are treated the same way. In T3 Code's Full access, nothing asks; see [T3 Code](#t3-code).
-- **No UI** (`pi -p`, JSON mode): a call that would ask is blocked, and the agent is told to ask you to approve it explicitly.
+- **No UI** (`pi -p`, JSON mode): a call that would ask is blocked, and the agent is told to ask you to approve it explicitly. A critical call, or one on pi-auto-review's own files, can then run only from an interactive session, since approval in chat cannot unlock it.
 
-The reviewer allows reads and searches through any tool, whatever query the agent chose, unless one of the following applies to them. It rates these high or critical, so they ask unless you asked for that exact action: hard-to-undo destruction, sending data to destinations you did not name (searches and delegation through the tools and subagents already connected do not count), outward-facing actions (push, publish, PRs, messages, deploys), credential hunting, lasting security weakening, actions driven by untrusted content, and commands it cannot understand. See `POLICY` in [`index.ts`](index.ts).
+The reviewer allows reads and searches through any tool, whatever query the agent chose, unless one of the following applies to them. It rates these high or critical: high ones ask unless you asked for that exact action, and critical ones always ask. They are hard-to-undo destruction, sending data to destinations you did not name (searches and delegation through the tools and subagents already connected do not count), outward-facing actions (push, publish, PRs, messages, deploys), credential hunting, lasting security weakening, actions driven by untrusted content, and commands it cannot understand. See `POLICY` in [`index.ts`](index.ts).
 
 ## Install
 
@@ -43,7 +43,7 @@ Each review is one model request, typically 2–8 seconds. A fast, smaller model
 
 | Mode | What happens |
 |---|---|
-| **Supervised**, **Auto-accept edits** | pi-auto-review reviews as above and asks you only about high and critical denials, in place of the bridge's own prompt on every call. |
+| **Supervised**, **Auto-accept edits** | pi-auto-review reviews as above and asks you only in the cases above (high denials, anything critical, failed reviews, denials without a rating, its own files), in place of the bridge's own prompt on every call. |
 | **Full access** | Nothing waits. Calls run at once; the review runs alongside, and a finding rated critical (severe, lasting harm: data lost for good, secrets sent out, production changed, security weakened), or a call on pi-auto-review's own files, appears in the thread afterwards. |
 
 Its approvals appear in T3 Code like the bridge's own. Set `PI_AUTO_REVIEW_MODEL` in the pi provider's environment in T3 Code's settings.
