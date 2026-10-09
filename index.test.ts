@@ -44,12 +44,13 @@ test("parseVerdict rejects anything it cannot trust", () => {
 	assert.equal(parseVerdict('{"outcome":"allow","risk":"critical","reason":"x"}')?.outcome, "deny");
 	assert.deepEqual(parseVerdict('{"outcome":"allow","risk":"Critical","reason":"x"}'), { outcome: "deny", risk: "critical", reason: "x" });
 	assert.equal(parseVerdict('{"outcome":"deny","reason":"x"}')?.outcome, "deny"); // no rating, a human decides
-	assert.equal(parseVerdict('{"outcome":"deny","risk":"high","reason":"x"}')?.outcome, "deny");
 });
 
-test("parseVerdict lets a denial below high run, as Codex's auto-review does", () => {
+test("parseVerdict derives the outcome from the risk, as Codex's auto-review does", () => {
 	assert.equal(parseVerdict('{"outcome":"deny","risk":"medium","reason":"not asked for"}')?.outcome, "allow");
 	assert.equal(parseVerdict('{"outcome":"deny","risk":"Low","reason":"x"}')?.outcome, "allow");
+	// High keeps the reviewer's call: it runs only when the user asked for that exact action.
+	assert.equal(parseVerdict('{"outcome":"deny","risk":"high","reason":"x"}')?.outcome, "deny");
 	assert.equal(parseVerdict('{"outcome":"allow","risk":"high","reason":"the user asked for this push"}')?.outcome, "allow");
 });
 
@@ -95,7 +96,7 @@ async function runCall(mode: string | undefined, risk: string, command = "x") {
 	return { blocked: result?.block === true, seen, mode: process.env.T3_PI_RUNTIME_MODE };
 }
 
-test("outside full access, the reviewer replaces T3's prompts and asks only on high-risk denials", async () => {
+test("outside full access, the reviewer replaces T3's prompts and asks only on high or unrated denials", async () => {
 	assert.deepEqual(await runCall("approval-required", "high"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
 	assert.deepEqual(await runCall("auto-accept-edits", "unknown"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
 	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: false, seen: ["review"], mode: undefined });
