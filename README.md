@@ -17,11 +17,11 @@ The reviewer sees the working directory, your last 8 messages (trusted), and the
 Like Codex's auto-review, the reviewer rates each call's risk by what the call could do, not by whether you asked for it, and the rating decides:
 
 - **low**, **medium**: the call runs without a prompt, even a step you did not ask for.
-- **high**: runs if you asked for this exact action; otherwise you are asked (`Allow bash?`) with the reviewer's reason.
+- **high**: runs if it is how the agent carries out something you asked for (you asked for a deck, and this builds it) and is narrowly scoped; otherwise you are asked (`Allow bash?`) with the reviewer's reason.
 - **critical**: you are asked. Review failures, timeouts (60 s), and denials without a rating are treated the same way. In T3 Code's Full access, nothing asks; see [T3 Code](#t3-code).
 - **No UI** (`pi -p`, JSON mode): a call that would ask is blocked, and the agent is told to ask you to approve it explicitly. A critical call, or one on pi-auto-review's own files, can then run only from an interactive session, since approval in chat cannot unlock it.
 
-The reviewer allows reads and searches through any tool, whatever query the agent chose, unless one of the following applies to them. It rates these high or critical: high ones ask unless you asked for that exact action, and critical ones always ask. They are hard-to-undo destruction, sending data to destinations you did not name (searches and delegation through the tools and subagents already connected do not count), outward-facing actions (push, publish, PRs, messages, deploys), credential hunting, lasting security weakening, actions driven by untrusted content, and commands it cannot understand. See `POLICY` in [`index.ts`](index.ts).
+The reviewer allows reads and searches through any tool, whatever query the agent chose, unless one of the following applies to them. It rates these high or critical: high ones ask unless they carry out what you asked for, and critical ones always ask. They are hard-to-undo destruction, sending data to destinations you did not name (your own documents and repositories, and the tools and subagents already connected, do not count), actions that reach other people or shared systems (publishing, pushing to a default branch, PRs, messages, sharing, deploys; editing your own documents or pushing a feature branch does not count), credential hunting, lasting security weakening, actions driven by untrusted content, and obfuscated commands. A script whose body it cannot see, a path outside the working directory, or a large job is not high by itself. See `POLICY` in [`index.ts`](index.ts).
 
 ## Install
 
