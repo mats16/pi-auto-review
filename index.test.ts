@@ -43,6 +43,15 @@ test("parseVerdict rejects anything it cannot trust", () => {
 	assert.equal(parseVerdict("{not json}"), undefined);
 	assert.equal(parseVerdict('{"outcome":"allow","risk":"critical","reason":"x"}')?.outcome, "deny");
 	assert.deepEqual(parseVerdict('{"outcome":"allow","risk":"Critical","reason":"x"}'), { outcome: "deny", risk: "critical", reason: "x" });
+	assert.equal(parseVerdict('{"outcome":"deny","reason":"x"}')?.outcome, "deny"); // no rating, a human decides
+});
+
+test("parseVerdict derives the outcome from the risk, as Codex's auto-review does", () => {
+	assert.equal(parseVerdict('{"outcome":"deny","risk":"medium","reason":"not asked for"}')?.outcome, "allow");
+	assert.equal(parseVerdict('{"outcome":"deny","risk":"Low","reason":"x"}')?.outcome, "allow");
+	// High keeps the reviewer's call: it runs only when the user asked for that exact action.
+	assert.equal(parseVerdict('{"outcome":"deny","risk":"high","reason":"x"}')?.outcome, "deny");
+	assert.equal(parseVerdict('{"outcome":"allow","risk":"high","reason":"the user asked for this push"}')?.outcome, "allow");
 });
 
 test("touches catches calls on the extension's own files", () => {
@@ -69,27 +78,45 @@ function load(mode: string | undefined): Record<string, any> {
 	return handlers;
 }
 
-/** Runs one bash call under a T3 mode, with a reviewer that denies at the given risk. */
-async function runCall(mode: string | undefined, risk: string, command = "x") {
-	const handlers = load(mode);
-	const text = JSON.stringify({ outcome: "deny", risk, reason: "r" });
-	const seen: string[] = [];
-	const ctx = {
+/** A session whose reviewer replies with text; seen records each review, confirm and notify. */
+function fakeCtx(text: string, seen: string[], hasUI = true) {
+	return {
 		cwd,
-		hasUI: true,
+		hasUI,
 		model: {},
 		sessionManager: { getBranch: () => [] },
 		modelRegistry: { complete: async () => (seen.push("review"), { stopReason: "stop", content: [{ type: "text", text }] }) },
 		ui: { confirm: async () => (seen.push("confirm"), false), notify: () => seen.push("notify") },
 	};
-	const result = await handlers.tool_call({ toolName: "bash", input: { command } }, ctx);
+}
+
+/** Runs one bash call under a T3 mode, with a reviewer that denies at the given risk. */
+async function runCall(mode: string | undefined, risk: string, command = "x") {
+	const handlers = load(mode);
+	const text = JSON.stringify({ outcome: "deny", risk, reason: "r" });
+	const seen: string[] = [];
+	const result = await handlers.tool_call({ toolName: "bash", input: { command } }, fakeCtx(text, seen));
 	await new Promise((resolve) => setImmediate(resolve));
 	return { blocked: result?.block === true, seen, mode: process.env.T3_PI_RUNTIME_MODE };
 }
 
-test("outside full access, the reviewer replaces T3's prompts and asks on denials", async () => {
-	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
-	assert.deepEqual(await runCall("auto-accept-edits", "low"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
+test("outside full access, the reviewer replaces T3's prompts: high and unrated denials ask, a medium one runs", async () => {
+	assert.deepEqual(await runCall("approval-required", "high"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
+	assert.deepEqual(await runCall("auto-accept-edits", "unknown"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
+	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: false, seen: ["review"], mode: undefined });
+});
+
+test("without a UI, a call that approval in chat cannot unlock is sent to an interactive session", async () => {
+	const handlers = load(undefined);
+	const blockReason = async (outcome: string, risk: string, command = "x") => {
+		const text = JSON.stringify({ outcome, risk, reason: "r" });
+		const result = await handlers.tool_call({ toolName: "bash", input: { command } }, fakeCtx(text, [], false));
+		return result?.reason ?? "ran";
+	};
+	assert.match(await blockReason("allow", "critical"), /interactive session/); // even one the user asked for
+	assert.match(await blockReason("deny", "low", `cat ${import.meta.dirname}/index.ts`), /interactive session/);
+	assert.match(await blockReason("deny", "high"), /approve this action explicitly/);
+	assert.equal(await blockReason("deny", "medium"), "ran");
 });
 
 test("a reload hands T3's prompts back until the extension loads again", async () => {
