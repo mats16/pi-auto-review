@@ -43,6 +43,14 @@ test("parseVerdict rejects anything it cannot trust", () => {
 	assert.equal(parseVerdict("{not json}"), undefined);
 	assert.equal(parseVerdict('{"outcome":"allow","risk":"critical","reason":"x"}')?.outcome, "deny");
 	assert.deepEqual(parseVerdict('{"outcome":"allow","risk":"Critical","reason":"x"}'), { outcome: "deny", risk: "critical", reason: "x" });
+	assert.equal(parseVerdict('{"outcome":"deny","reason":"x"}')?.outcome, "deny"); // no rating, a human decides
+	assert.equal(parseVerdict('{"outcome":"deny","risk":"high","reason":"x"}')?.outcome, "deny");
+});
+
+test("parseVerdict lets a denial below high run, as Codex's auto-review does", () => {
+	assert.equal(parseVerdict('{"outcome":"deny","risk":"medium","reason":"not asked for"}')?.outcome, "allow");
+	assert.equal(parseVerdict('{"outcome":"deny","risk":"Low","reason":"x"}')?.outcome, "allow");
+	assert.equal(parseVerdict('{"outcome":"allow","risk":"high","reason":"the user asked for this push"}')?.outcome, "allow");
 });
 
 test("touches catches calls on the extension's own files", () => {
@@ -87,9 +95,10 @@ async function runCall(mode: string | undefined, risk: string, command = "x") {
 	return { blocked: result?.block === true, seen, mode: process.env.T3_PI_RUNTIME_MODE };
 }
 
-test("outside full access, the reviewer replaces T3's prompts and asks on denials", async () => {
-	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
-	assert.deepEqual(await runCall("auto-accept-edits", "low"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
+test("outside full access, the reviewer replaces T3's prompts and asks only on high-risk denials", async () => {
+	assert.deepEqual(await runCall("approval-required", "high"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
+	assert.deepEqual(await runCall("auto-accept-edits", "unknown"), { blocked: true, seen: ["review", "confirm"], mode: undefined });
+	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: false, seen: ["review"], mode: undefined });
 });
 
 test("a reload hands T3's prompts back until the extension loads again", async () => {

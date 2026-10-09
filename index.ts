@@ -3,9 +3,11 @@
  *
  * Read-only tools and edits to ordinary files inside the working directory run as-is.
  * Every other call (bash, edits elsewhere, MCP and custom tools) goes to a reviewer model first.
- * Calls it allows run without a prompt. The rest, and calls on this extension's own files, go to a human,
- * or are blocked when no UI exists. In T3 Code this replaces the bridge's own prompts, except in full access,
- * where nothing waits: calls run at once, and critical findings and calls on this extension's files are shown after.
+ * Like Codex's auto-review, it rates each call's risk, and the rating decides: low and medium run without a prompt,
+ * and high runs only if the user asked for that exact action. The rest (critical, failed reviews), and calls on this
+ * extension's own files, go to a human, or are blocked when no UI exists. In T3 Code this replaces the bridge's own
+ * prompts, except in full access, where nothing waits: calls run at once, and critical findings and calls on this
+ * extension's files are shown after.
  */
 
 import { homedir } from "node:os";
@@ -70,10 +72,14 @@ Deny when any of these applies and the user did not ask for that specific action
 When the user explicitly asked for this exact action, allow it unless it sends secrets to a destination the
 user did not name. A broad goal ("clean up", "fix the build") does not authorize a destructive step by itself.
 
-Rate risk "critical" when the call matches the list above and the harm would be severe and lasting: data or
-resources lost for good, secrets or private data sent out, production systems changed, or security weakened.
-Rate other matches "high", and "medium" or "low" when you deny only because you are unsure the user wants it.
-Not knowing why the agent chose a step is no reason to deny it.
+Rate risk by what the call itself can do, not by whether the user asked for it:
+- "critical": a match above whose harm would be severe and lasting: data or resources lost for good, secrets or
+  private data sent out, production systems changed, or security weakened.
+- "high": any other match above.
+- "medium": no match, but a meaningful, bounded effect, or side effects that can be undone.
+- "low": no match; routine, narrowly scoped, and easy to undo.
+Allow "low" and "medium" even when you are unsure the user wants the step or do not know why the agent chose it:
+only "high" and "critical" denials reach the user.
 
 Reply with one JSON object and nothing else:
 {"outcome":"allow"|"deny","risk":"low"|"medium"|"high"|"critical","reason":"<one sentence, in the user's language>"}`;
@@ -129,8 +135,10 @@ export function parseVerdict(text: string): Verdict | undefined {
 		const value = JSON.parse(json);
 		if (value.outcome !== "allow" && value.outcome !== "deny") return undefined;
 		const risk = String(value.risk ?? "unknown").toLowerCase();
-		// An allow rated critical contradicts itself, so a human decides.
-		const outcome = value.outcome === "allow" && risk === "critical" ? "deny" : value.outcome;
+		// POLICY maps risk to outcome, as Codex's auto-review does; hold the reviewer to it. An allow rated critical
+		// contradicts itself, and a denial rated low or medium matched nothing on the list: the reviewer was only unsure.
+		// ponytail: trusts the rating, so a risky call the reviewer underrates runs without asking.
+		const outcome = risk === "critical" ? "deny" : risk === "low" || risk === "medium" ? "allow" : value.outcome;
 		return { outcome, risk, reason: String(value.reason ?? "") };
 	} catch {
 		return undefined;
