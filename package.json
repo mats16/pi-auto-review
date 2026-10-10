@@ -30,7 +30,8 @@
     ]
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "eval": "node --test --test-timeout=180000 review.eval.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
