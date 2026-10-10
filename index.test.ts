@@ -131,8 +131,10 @@ test("a reload hands T3's prompts back until the extension loads again", async (
 	assert.equal(load(undefined).session_shutdown, undefined); // plain pi has no T3 mode to hand back
 });
 
-test("full access never waits and shows only critical findings and self calls", async () => {
-	assert.deepEqual(await runCall("full-access", "critical"), { blocked: false, seen: ["review:low", "notify"], mode: "full-access" });
+test("full access never asks: it blocks critical and self calls, and runs the rest", async () => {
+	assert.deepEqual(await runCall("full-access", "critical"), { blocked: true, seen: ["review:low"], mode: "full-access" });
+	assert.deepEqual(await runCall("full-access", "low", `cat ${import.meta.dirname}/index.ts`), { blocked: true, seen: [], mode: "full-access" });
 	assert.deepEqual(await runCall("full-access", "high"), { blocked: false, seen: ["review:low"], mode: "full-access" });
-	assert.deepEqual(await runCall("full-access", "low", `cat ${import.meta.dirname}/index.ts`), { blocked: false, seen: ["notify"], mode: "full-access" });
+	// A review that did not happen runs, and the user is told.
+	assert.deepEqual(await runCall("full-access", "unknown"), { blocked: false, seen: ["review:low", "notify"], mode: "full-access" });
 });
