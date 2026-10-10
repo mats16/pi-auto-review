@@ -6,7 +6,7 @@ pi-auto-review is a [pi](https://pi.dev) extension: a reviewer model approves ro
 
 - `index.ts`: the whole extension. pi loads it as TypeScript; there is no build step.
 - `index.test.ts`: tests for the exported decision functions (`needsReview`, `touches`, `parseVerdict`).
-- `review.eval.ts`: replays the prompts the user approved in T3 Code's history, and patterns synthesized from it (calls that must run, and the risky variants that must still ask), against a live reviewer. Local only.
+- `review.eval.ts`: replays the prompts the user approved in T3 Code's history and lists those that still ask, and checks patterns synthesized from it (calls that must run, and the risky variants that must still ask), against a live reviewer. Local only.
 - `.github/workflows/pullfrog.yml`: generated; edit only where it says so.
 
 ## Commands
