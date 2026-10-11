@@ -99,6 +99,10 @@ test("reviewer takes PI_AUTO_REVIEW_MODEL, then autoReview.model in the user's s
 	assert.deepEqual(pick("openai/gpt-6-1-sol:low"), { model: "openai/gpt-6-1-sol", reasoning: "low" });
 	assert.deepEqual(pick("ollama/qwen2.5-coder:7b"), { model: "ollama/qwen2.5-coder:7b", reasoning: "high" }); // ":7b" is part of the ID
 	assert.deepEqual(pick("gpt-6-1-sol"), { model: undefined, reasoning: "high" }); // no provider, a human decides
+	writeFileSync(join(agentDir, "settings.json"), `﻿${JSON.stringify({ autoReview: { model: "oss/glm:low" } })}`);
+	assert.deepEqual(pick(undefined), { model: "oss/glm", reasoning: "low" }); // pi drops a leading BOM
+	writeFileSync(join(agentDir, "settings.json"), "");
+	assert.deepEqual(pick(undefined), { model: "session", reasoning: "high" }); // pi reads an empty file as no settings
 	settings({ autoReview: { model: { id: "glm" } } });
 	assert.deepEqual(pick(undefined).model, undefined); // not a "provider/model" string, a human decides
 	writeFileSync(join(agentDir, "settings.json"), "{");

@@ -198,14 +198,16 @@ const SELF_VERDICT = unreviewed("Calls on pi-auto-review's own files are never l
 function settingsModel(): string | undefined {
 	// ponytail: mirrors pi's getAgentDir (imports stay type-only); recheck when pi moves its agent directory.
 	const dir = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=$|[/\\])/, homedir()) || join(homedir(), ".pi", "agent");
-	let settings;
+	let content;
 	try {
-		settings = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
+		content = readFileSync(join(dir, "settings.json"), "utf8");
 	} catch (error) {
 		if ((error as { code?: string }).code === "ENOENT") return undefined;
 		throw error;
 	}
-	const model = settings?.autoReview?.model;
+	// As pi reads it: an empty file is no settings, and a leading BOM is dropped.
+	if (content === "") return undefined;
+	const model = JSON.parse(content.replace(/^﻿/, ""))?.autoReview?.model;
 	return model === undefined || model === "" ? undefined : String(model);
 }
 
