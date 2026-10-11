@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { homedir } from "node:os";
-import autoReview, { needsReview, parseVerdict, touches } from "./index.ts";
+import autoReview, { needsReview, parseVerdict, reviewer, touches } from "./index.ts";
 
 const cwd = "/work/project";
 
@@ -69,6 +69,31 @@ test("touches catches calls on the extension's own files", () => {
 	assert.equal(touches(self, "read", { path: `${self}/index.ts` }, cwd), false);
 });
 
+test("reviewer takes PI_AUTO_REVIEW_MODEL, then the provider pi-auto-review in models.json, then the session's model", () => {
+	const listed = [
+		{ provider: "oss", id: "glm" },
+		{ provider: "pi-auto-review", id: "glm-flash" },
+	];
+	const ctx = (all: object[]) => ({ model: "session", modelRegistry: { getAll: () => all, find: (p: string, id: string) => `${p}/${id}` } }) as any;
+	const pick = (spec: string | undefined, all = listed) => {
+		if (spec === undefined) delete process.env.PI_AUTO_REVIEW_MODEL;
+		else process.env.PI_AUTO_REVIEW_MODEL = spec;
+		try {
+			return reviewer(ctx(all));
+		} finally {
+			delete process.env.PI_AUTO_REVIEW_MODEL;
+		}
+	};
+	assert.deepEqual(pick(undefined), { model: listed[1], reasoning: "high" });
+	assert.deepEqual(pick(undefined, [listed[0], { provider: "proxy", id: "pi-auto-review" }]).model, "session"); // only the provider counts
+	assert.deepEqual(pick(undefined, [listed[0]]), { model: "session", reasoning: "high" });
+	assert.deepEqual(pick(""), { model: listed[1], reasoning: "high" });
+	assert.deepEqual(pick("openai/gpt-6-1-sol"), { model: "openai/gpt-6-1-sol", reasoning: "high" });
+	assert.deepEqual(pick("openai/gpt-6-1-sol:low"), { model: "openai/gpt-6-1-sol", reasoning: "low" });
+	assert.deepEqual(pick("ollama/qwen2.5-coder:7b"), { model: "ollama/qwen2.5-coder:7b", reasoning: "high" }); // ":7b" is part of the ID
+	assert.deepEqual(pick("gpt-6-1-sol"), { model: undefined, reasoning: "high" }); // no provider, a human decides
+});
+
 /** Loads the extension as T3 Code would start pi in the given mode. */
 function load(mode: string | undefined): Record<string, any> {
 	if (mode === undefined) delete process.env.T3_PI_RUNTIME_MODE;
@@ -86,6 +111,7 @@ function fakeCtx(text: string, seen: string[], hasUI = true) {
 		model: {},
 		sessionManager: { getBranch: () => [] },
 		modelRegistry: {
+			getAll: () => [],
 			streamSimple: (_model: unknown, _context: unknown, options: { reasoning?: string }) => ({
 				result: async () => (seen.push(`review:${options.reasoning}`), { stopReason: "stop", content: [{ type: "text", text }] }),
 			}),
@@ -105,9 +131,9 @@ async function runCall(mode: string | undefined, risk: string, command = "x") {
 }
 
 test("outside full access, the reviewer replaces T3's prompts: high and unrated denials ask, a medium one runs", async () => {
-	assert.deepEqual(await runCall("approval-required", "high"), { blocked: true, seen: ["review:low", "confirm"], mode: undefined });
-	assert.deepEqual(await runCall("auto-accept-edits", "unknown"), { blocked: true, seen: ["review:low", "confirm"], mode: undefined });
-	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: false, seen: ["review:low"], mode: undefined });
+	assert.deepEqual(await runCall("approval-required", "high"), { blocked: true, seen: ["review:high", "confirm"], mode: undefined });
+	assert.deepEqual(await runCall("auto-accept-edits", "unknown"), { blocked: true, seen: ["review:high", "confirm"], mode: undefined });
+	assert.deepEqual(await runCall("approval-required", "medium"), { blocked: false, seen: ["review:high"], mode: undefined });
 });
 
 test("without a UI, a call that approval in chat cannot unlock is sent to an interactive session", async () => {
@@ -132,9 +158,9 @@ test("a reload hands T3's prompts back until the extension loads again", async (
 });
 
 test("full access never asks: it blocks critical and self calls, and runs the rest", async () => {
-	assert.deepEqual(await runCall("full-access", "critical"), { blocked: true, seen: ["review:low"], mode: "full-access" });
+	assert.deepEqual(await runCall("full-access", "critical"), { blocked: true, seen: ["review:high"], mode: "full-access" });
 	assert.deepEqual(await runCall("full-access", "low", `cat ${import.meta.dirname}/index.ts`), { blocked: true, seen: [], mode: "full-access" });
-	assert.deepEqual(await runCall("full-access", "high"), { blocked: false, seen: ["review:low"], mode: "full-access" });
+	assert.deepEqual(await runCall("full-access", "high"), { blocked: false, seen: ["review:high"], mode: "full-access" });
 	// A review that did not happen runs, and the user is told.
-	assert.deepEqual(await runCall("full-access", "unknown"), { blocked: false, seen: ["review:low", "notify"], mode: "full-access" });
+	assert.deepEqual(await runCall("full-access", "unknown"), { blocked: false, seen: ["review:high", "notify"], mode: "full-access" });
 });

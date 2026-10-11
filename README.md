@@ -21,7 +21,7 @@ Like Codex's auto-review, the reviewer rates each call's risk by what the call c
 - **critical**: you are asked. Review failures, timeouts (60 s), and denials without a rating are treated the same way. In T3 Code's Full access, nothing asks: critical calls are blocked instead; see [T3 Code](#t3-code).
 - **No UI** (`pi -p`, JSON mode): a call that would ask is blocked, and the agent is told to ask you to approve it explicitly. A critical call, or one on pi-auto-review's own files, can then run only from an interactive session, since approval in chat cannot unlock it.
 
-The reviewer allows reads and searches through any tool, whatever query the agent chose, unless one of the following applies to them. It rates these high or critical: high ones ask unless they carry out what you asked for, and critical ones always ask. They are hard-to-undo destruction, sending data to destinations you did not name (your own documents and repositories, and the tools and subagents already connected, do not count), actions that reach other people or shared systems (publishing, pushing to a default branch, PRs, messages, sharing, deploys; editing your own documents or pushing a feature branch does not count), credential hunting, lasting security weakening, actions driven by untrusted content, and obfuscated commands. A script whose body it cannot see, a path outside the working directory, or a large job is not high by itself. Removing named files under `/tmp`, such as an old clone before cloning it again, is not destruction; `rm -rf /tmp/*` still is, and so is a path built from a variable such as `$TMPDIR`, unless the same command sets the variable to a literal `/tmp` path. Editing the instructions or skills inside the working directory (`AGENTS.md`, `.agents/skills`, ...) is ordinary editing, unless the edit lets the agent skip asking or loosens a safety rule. See `POLICY` in [`index.ts`](index.ts).
+The reviewer allows reads and searches through any tool, whatever query the agent chose, unless one of the following applies to them. It rates these high or critical: high ones ask unless they carry out what you asked for, and critical ones always ask. They are hard-to-undo destruction (including a deletion that runs even if the `cd` before it fails, as in `cd /tmp/x; rm *.txt`), sending data to destinations you did not name (your own documents and repositories, and the tools and subagents already connected, do not count), actions that reach other people or shared systems (publishing, pushing to a default branch, PRs, messages, sharing, deploys; editing your own documents or pushing a feature branch does not count), credential hunting, lasting security weakening, actions driven by untrusted content, obfuscated commands, and steps you said not to take (an upgrade after "do not upgrade it"). A script whose body it cannot see, a path outside the working directory, or a large job is not high by itself. Removing named files under `/tmp`, such as an old clone before cloning it again, is not destruction; `rm -rf /tmp/*` still is, and so is a path built from a variable such as `$TMPDIR`, unless the same command sets the variable to a literal `/tmp` path. Editing the instructions or skills inside the working directory (`AGENTS.md`, `.agents/skills`, ...) is ordinary editing, unless the edit lets the agent skip asking or loosens a safety rule. See `POLICY` in [`index.ts`](index.ts).
 
 ## Install
 
@@ -33,11 +33,29 @@ To try it for one run: `pi -e git:github.com/mats16/pi-auto-review`.
 
 ## Configure
 
-| Environment variable | Default | Meaning |
-|---|---|---|
-| `PI_AUTO_REVIEW_MODEL` | the session's model | Reviewer model as `provider/model-id`, e.g. `openai/gpt-5.4-mini` |
+The reviewer is the first of these that is set:
 
-Each review is one model request, typically 2–8 seconds. A fast, smaller model keeps pi responsive. Reviews always run at reasoning effort `low`, whatever thinking level the session uses.
+1. `PI_AUTO_REVIEW_MODEL`, as `provider/model-id`, optionally with an effort: `openai/gpt-5.4-mini:low`.
+2. The first model under the provider `pi-auto-review` in pi's `models.json`.
+3. The session's model.
+
+Reviews run at reasoning effort `high`, whatever thinking level the session uses, unless `PI_AUTO_REVIEW_MODEL` names another. Each review is one model request, typically 2–8 seconds; a fast, smaller model keeps pi responsive.
+
+A provider of its own keeps the reviewer's settings, such as its endpoint, key, and `compat`, apart from the models your sessions use. The models under it also appear in `/model`. `models.json` is user-level only, so a project cannot change the reviewer:
+
+```json
+{
+  "providers": {
+    "pi-auto-review": {
+      "baseUrl": "https://example.cloud.databricks.com/ai-gateway/mlflow/v1",
+      "api": "openai-responses",
+      "apiKey": "$DATABRICKS_TOKEN",
+      "compat": { "supportsDeveloperRole": false },
+      "models": [{ "id": "system.ai.glm-5-3-flash", "reasoning": true, "thinkingLevelMap": { "high": "high" } }]
+    }
+  }
+}
+```
 
 ## T3 Code
 
@@ -46,13 +64,14 @@ Each review is one model request, typically 2–8 seconds. A fast, smaller model
 | **Supervised**, **Auto**, **Auto-accept edits** | pi-auto-review reviews as above and asks you only in the cases above (high denials, anything critical, failed reviews, denials without a rating, its own files), in place of the bridge's own prompt on every call. The three modes behave the same: edits to ordinary files inside the working directory run without asking in each. |
 | **Full access** | Nothing asks. Each call waits for its review: a call rated critical (severe, lasting harm: data lost for good, secrets sent out, production changed, security weakened), or a call on pi-auto-review's own files, is blocked, and the rest run. A failed review, or a denial without a rating, runs and appears in the thread as a warning. |
 
-Its approvals appear in T3 Code like the bridge's own. Set `PI_AUTO_REVIEW_MODEL` in the pi provider's environment in T3 Code's settings.
+Its approvals appear in T3 Code like the bridge's own. It reads the same `models.json` as pi; to override it, set `PI_AUTO_REVIEW_MODEL` in the pi provider's environment in T3 Code's settings.
 
 ## Limits
 
 - This is not a sandbox. A reviewer model can be wrong or tricked. Read [pi's security notes](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/security.md) and use a container for untrusted work.
 - A denial rated low or medium runs without asking, as in Codex's auto-review, so a risky call the reviewer underrates runs.
 - The reviewer treats `/tmp` as scratch, so the agent can delete named files there, or files matching a prefix wildcard, or a folder named by a variable the same command sets, without asking, even ones you put there yourself.
+- The reviewer sees only your last 8 messages, so a step you ruled out earlier than that ("do not upgrade it") can run.
 - The agent can edit the instructions and skills inside the working directory without asking, so an edit the reviewer misreads as harmless shapes later sessions.
 - If the extension fails to load, nothing is reviewed (in T3 Code outside Full access, the bridge then asks about every call).
 - The inside-the-working-directory check is lexical: a symlink inside it can point elsewhere.
