@@ -8,6 +8,8 @@
  * and calls on this extension's own files, go to a human, or are blocked when no UI exists. In T3 Code this replaces
  * the bridge's own prompts, except in full access, where nothing asks: critical calls and calls on this extension's
  * files are blocked, the rest run, and a review that did not happen is shown.
+ * The reviewer is PI_AUTO_REVIEW_MODEL, else the model models.json lists under the provider pi-auto-review, else the
+ * session's model, run at reasoning effort high unless PI_AUTO_REVIEW_MODEL names another.
  */
 
 import { homedir } from "node:os";
@@ -20,7 +22,8 @@ const SELF_DIR = dirname(fileURLToPath(import.meta.url));
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const FILE_TOOLS = new Set(["edit", "write"]);
 const TIMEOUT_MS = 60_000;
-const REASONING = "low";
+const REASONING = "high";
+const REVIEWER = "pi-auto-review";
 const MAX_USER_MESSAGES = 8;
 const MAX_CHARS = 4_000;
 
@@ -188,15 +191,24 @@ function unreviewed(reason: string): Verdict {
 /** Calls on this extension's own files skip the reviewer, so the agent cannot talk it into them. */
 const SELF_VERDICT = unreviewed("Calls on pi-auto-review's own files are never left to the reviewer.");
 
-function reviewerModel(ctx: ExtensionContext) {
+/**
+ * The reviewer and its effort: PI_AUTO_REVIEW_MODEL ("provider/model", ":level" optional), else the first model that
+ * models.json lists under the provider pi-auto-review, so its settings stay apart from the session's models, else the
+ * session's model.
+ */
+export function reviewer(ctx: ExtensionContext) {
 	const spec = process.env.PI_AUTO_REVIEW_MODEL;
-	if (spec === undefined || spec === "") return ctx.model;
-	const slash = spec.indexOf("/");
-	return slash > 0 ? ctx.modelRegistry.find(spec.slice(0, slash), spec.slice(slash + 1)) : undefined;
+	if (spec === undefined || spec === "") {
+		return { model: ctx.modelRegistry.getAll().find((m) => m.provider === REVIEWER) ?? ctx.model, reasoning: REASONING };
+	}
+	// Model IDs can contain ":" (qwen2.5-coder:7b), so only a known level after the last one counts as the effort.
+	const [, name, reasoning = REASONING] = spec.match(/^(.*?)(?::(minimal|low|medium|high|xhigh|max))?$/)!;
+	const slash = name.indexOf("/");
+	return { model: slash > 0 ? ctx.modelRegistry.find(name.slice(0, slash), name.slice(slash + 1)) : undefined, reasoning };
 }
 
 export async function review(ctx: ExtensionContext, toolName: string, input: unknown): Promise<Verdict> {
-	const model = reviewerModel(ctx);
+	const { model, reasoning } = reviewer(ctx);
 	if (model === undefined) {
 		return unreviewed(`Reviewer model not found (PI_AUTO_REVIEW_MODEL=${process.env.PI_AUTO_REVIEW_MODEL ?? ""}).`);
 	}
@@ -219,7 +231,7 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 			.streamSimple(
 				model,
 				{ systemPrompt: POLICY, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-				{ reasoning: REASONING, signal },
+				{ reasoning, signal },
 			)
 			.result();
 		if (response.stopReason === "error" || response.stopReason === "aborted") {

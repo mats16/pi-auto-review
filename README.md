@@ -33,11 +33,29 @@ To try it for one run: `pi -e git:github.com/mats16/pi-auto-review`.
 
 ## Configure
 
-| Environment variable | Default | Meaning |
-|---|---|---|
-| `PI_AUTO_REVIEW_MODEL` | the session's model | Reviewer model as `provider/model-id`, e.g. `openai/gpt-5.4-mini` |
+The reviewer is the first of these that is set:
 
-Each review is one model request, typically 2–8 seconds. A fast, smaller model keeps pi responsive. Reviews always run at reasoning effort `low`, whatever thinking level the session uses.
+1. `PI_AUTO_REVIEW_MODEL`, as `provider/model-id`, optionally with an effort: `openai/gpt-5.4-mini:low`.
+2. The first model under the provider `pi-auto-review` in pi's `models.json`.
+3. The session's model.
+
+Reviews run at reasoning effort `high`, whatever thinking level the session uses, unless `PI_AUTO_REVIEW_MODEL` names another. Each review is one model request, typically 2–8 seconds; a fast, smaller model keeps pi responsive.
+
+A provider of its own keeps the reviewer's settings, such as its endpoint, key, and `compat`, apart from the models your sessions use. The models under it also appear in `/model`. `models.json` is user-level only, so a project cannot change the reviewer:
+
+```json
+{
+  "providers": {
+    "pi-auto-review": {
+      "baseUrl": "https://example.cloud.databricks.com/ai-gateway/mlflow/v1",
+      "api": "openai-responses",
+      "apiKey": "$DATABRICKS_TOKEN",
+      "compat": { "supportsDeveloperRole": false },
+      "models": [{ "id": "system.ai.glm-5-3-flash", "reasoning": true, "thinkingLevelMap": { "high": "high" } }]
+    }
+  }
+}
+```
 
 ## T3 Code
 
@@ -46,7 +64,7 @@ Each review is one model request, typically 2–8 seconds. A fast, smaller model
 | **Supervised**, **Auto**, **Auto-accept edits** | pi-auto-review reviews as above and asks you only in the cases above (high denials, anything critical, failed reviews, denials without a rating, its own files), in place of the bridge's own prompt on every call. The three modes behave the same: edits to ordinary files inside the working directory run without asking in each. |
 | **Full access** | Nothing asks. Each call waits for its review: a call rated critical (severe, lasting harm: data lost for good, secrets sent out, production changed, security weakened), or a call on pi-auto-review's own files, is blocked, and the rest run. A failed review, or a denial without a rating, runs and appears in the thread as a warning. |
 
-Its approvals appear in T3 Code like the bridge's own. Set `PI_AUTO_REVIEW_MODEL` in the pi provider's environment in T3 Code's settings.
+Its approvals appear in T3 Code like the bridge's own. It reads the same `models.json` as pi; to override it, set `PI_AUTO_REVIEW_MODEL` in the pi provider's environment in T3 Code's settings.
 
 ## Limits
 

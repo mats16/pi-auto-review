@@ -1,7 +1,8 @@
 /**
  * Replays real reviews against a live reviewer model. Local only: it reads T3 Code's history and calls a model,
- * so `npm test` skips it. Run `npm run eval`; PI_AUTO_REVIEW_MODEL picks the reviewer as in the extension, and
- * pi's default model reviews when it is unset. Filter with --test-name-pattern.
+ * so `npm test` skips it. Run `npm run eval`; the reviewer and its effort are picked as in the extension, from
+ * PI_AUTO_REVIEW_MODEL or pi's models.json, and pi's default model reviews when neither names one.
+ * Filter with --test-name-pattern.
  *
  * The history replay measures: approving a prompt once does not make it a false positive, so an accepted prompt that
  * still asks is listed as TODO for a human to judge, not failed. The synthesized patterns are the regression suite:
@@ -10,7 +11,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -214,19 +215,34 @@ const SYNTHETIC: Synthetic[] = [
 	].map((command) => asks(command, FIX_BUILD, command, APP)),
 ];
 
-/** A session whose reviewer is pi itself, run with the system prompt, prompt, and reasoning review() chose. */
+interface Ref {
+	provider: string;
+	id: string;
+}
+
+/** The models pi's models.json lists, enough for review() to pick the reviewer the way the extension does. */
+function configured(): Ref[] {
+	const file = join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent"), "models.json");
+	if (!existsSync(file)) return [];
+	const providers: Record<string, { models?: { id: string }[] }> = JSON.parse(readFileSync(file, "utf8")).providers ?? {};
+	return Object.entries(providers).flatMap(([provider, p]) => (p.models ?? []).map(({ id }) => ({ provider, id })));
+}
+const CONFIGURED = configured();
+
+/** A session whose reviewer is pi itself, run with the system prompt, prompt, model, and reasoning review() chose. */
 function liveCtx(c: Case) {
 	return {
 		cwd: c.cwd,
-		model: "", // pi's default model
+		model: { provider: "", id: "" }, // pi's default model
 		sessionManager: { getBranch: () => c.messages.map((content) => ({ type: "message", message: { role: "user", content } })) },
 		modelRegistry: {
-			find: (provider: string, id: string) => `${provider}/${id}`,
-			streamSimple: (model: string, context: any, options: { reasoning: string; signal: AbortSignal }) => ({
+			getAll: () => CONFIGURED,
+			find: (provider: string, id: string): Ref => ({ provider, id }),
+			streamSimple: (model: Ref, context: any, options: { reasoning: string; signal: AbortSignal }) => ({
 				result: () =>
 					new Promise((resolve) => {
 						const args = ["-p", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files"];
-						if (model !== "") args.push("--model", model);
+						if (model.provider !== "") args.push("--model", `${model.provider}/${model.id}`);
 						args.push("--thinking", options.reasoning, "--system-prompt", context.systemPrompt, context.messages[0].content[0].text);
 						const child = execFile("pi", args, { cwd: tmpdir(), signal: options.signal, maxBuffer: 1 << 20 }, (error, stdout, stderr) =>
 							resolve(
