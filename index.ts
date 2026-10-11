@@ -8,10 +8,11 @@
  * and calls on this extension's own files, go to a human, or are blocked when no UI exists. In T3 Code this replaces
  * the bridge's own prompts, except in full access, where nothing asks: critical calls and calls on this extension's
  * files are blocked, the rest run, and a review that did not happen is shown.
- * The reviewer is PI_AUTO_REVIEW_MODEL, else the model models.json lists under the provider pi-auto-review, else the
- * session's model, run at reasoning effort high unless PI_AUTO_REVIEW_MODEL names another.
+ * The reviewer is PI_AUTO_REVIEW_MODEL, else autoReview.model in pi's user settings.json, else the session's model, run
+ * at reasoning effort high unless the one named gives another.
  */
 
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +24,6 @@ const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const FILE_TOOLS = new Set(["edit", "write"]);
 const TIMEOUT_MS = 60_000;
 const REASONING = "high";
-const REVIEWER = "pi-auto-review";
 const MAX_USER_MESSAGES = 8;
 const MAX_CHARS = 4_000;
 
@@ -192,26 +192,45 @@ function unreviewed(reason: string): Verdict {
 const SELF_VERDICT = unreviewed("Calls on pi-auto-review's own files are never left to the reviewer.");
 
 /**
- * The reviewer and its effort: PI_AUTO_REVIEW_MODEL ("provider/model", ":level" optional), else the first model that
- * models.json lists under the provider pi-auto-review, so its settings stay apart from the session's models, else the
- * session's model.
+ * autoReview.model in pi's user settings.json. Only the user's file counts: pi merges a project's .pi/settings.json
+ * into its settings, and a project must not pick its own reviewer. Throws if the file exists but cannot be read.
+ */
+function settingsModel(): string | undefined {
+	// ponytail: mirrors pi's getAgentDir (imports stay type-only); recheck when pi moves its agent directory.
+	const dir = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=$|[/\\])/, homedir()) || join(homedir(), ".pi", "agent");
+	let settings;
+	try {
+		settings = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
+	} catch (error) {
+		if ((error as { code?: string }).code === "ENOENT") return undefined;
+		throw error;
+	}
+	const model = settings?.autoReview?.model;
+	return model === undefined || model === "" ? undefined : String(model);
+}
+
+/**
+ * The reviewer and its effort, from "provider/model" with an optional ":level": PI_AUTO_REVIEW_MODEL, else
+ * autoReview.model in pi's user settings.json, else the session's model.
  */
 export function reviewer(ctx: ExtensionContext) {
-	const spec = process.env.PI_AUTO_REVIEW_MODEL;
-	if (spec === undefined || spec === "") {
-		return { model: ctx.modelRegistry.getAll().find((m) => m.provider === REVIEWER) ?? ctx.model, reasoning: REASONING };
-	}
+	const spec = process.env.PI_AUTO_REVIEW_MODEL || settingsModel();
+	if (spec === undefined) return { model: ctx.model, reasoning: REASONING, spec };
 	// Model IDs can contain ":" (qwen2.5-coder:7b), so only a known level after the last one counts as the effort.
 	const [, name, reasoning = REASONING] = spec.match(/^(.*?)(?::(minimal|low|medium|high|xhigh|max))?$/)!;
 	const slash = name.indexOf("/");
-	return { model: slash > 0 ? ctx.modelRegistry.find(name.slice(0, slash), name.slice(slash + 1)) : undefined, reasoning };
+	return { model: slash > 0 ? ctx.modelRegistry.find(name.slice(0, slash), name.slice(slash + 1)) : undefined, reasoning, spec };
 }
 
 export async function review(ctx: ExtensionContext, toolName: string, input: unknown): Promise<Verdict> {
-	const { model, reasoning } = reviewer(ctx);
-	if (model === undefined) {
-		return unreviewed(`Reviewer model not found (PI_AUTO_REVIEW_MODEL=${process.env.PI_AUTO_REVIEW_MODEL ?? ""}).`);
+	let picked;
+	try {
+		picked = reviewer(ctx);
+	} catch (error) {
+		return unreviewed(`Cannot read the reviewer from pi's settings.json: ${error instanceof Error ? error.message : error}`);
 	}
+	const { model, reasoning, spec } = picked;
+	if (model === undefined) return unreviewed(`Reviewer model not found (${spec ?? "none set, and no session model"}).`);
 	const requests = userMessages(ctx);
 	const prompt = [
 		`Working directory: ${ctx.cwd}`,

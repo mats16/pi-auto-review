@@ -36,26 +36,18 @@ To try it for one run: `pi -e git:github.com/mats16/pi-auto-review`.
 The reviewer is the first of these that is set:
 
 1. `PI_AUTO_REVIEW_MODEL`, as `provider/model-id`, optionally with an effort: `openai/gpt-5.4-mini:low`.
-2. The first model under the provider `pi-auto-review` in pi's `models.json`.
+2. `autoReview.model` in pi's user `settings.json` (`~/.pi/agent/settings.json`), in the same form.
 3. The session's model.
 
-Reviews run at reasoning effort `high`, whatever thinking level the session uses, unless `PI_AUTO_REVIEW_MODEL` names another. Each review is one model request, typically 2–8 seconds; a fast, smaller model keeps pi responsive. [Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md) compares models and efforts by accuracy, speed, and cost.
-
-A provider of its own keeps the reviewer's settings, such as its endpoint, key, and `compat`, apart from the models your sessions use. The models under it also appear in `/model`. `models.json` is user-level only, so a project cannot change the reviewer:
+Reviews run at reasoning effort `high`, whatever thinking level the session uses, unless the model setting names another. Each review is one model request, typically 2–8 seconds; a fast, smaller model keeps pi responsive. [Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md) compares models and efforts by accuracy, speed, and cost.
 
 ```json
 {
-  "providers": {
-    "pi-auto-review": {
-      "baseUrl": "https://example.cloud.databricks.com/ai-gateway/mlflow/v1",
-      "api": "openai-responses",
-      "apiKey": "$DATABRICKS_TOKEN",
-      "compat": { "supportsDeveloperRole": false },
-      "models": [{ "id": "system.ai.glm-5-3-flash", "reasoning": true, "thinkingLevelMap": { "high": "high" } }]
-    }
-  }
+  "autoReview": { "model": "databricks-oss/system.ai.glm-5-3-flash" }
 }
 ```
+
+The model can be any model in pi's `models.json`. Only the user-level `settings.json` counts, so a project's `.pi/settings.json` cannot change the reviewer. Some models behind OpenAI-compatible gateways ignore a system prompt sent in the `developer` role, so every review fails; give those `"compat": { "supportsDeveloperRole": false }` in `models.json`.
 
 ## T3 Code
 
@@ -64,7 +56,7 @@ A provider of its own keeps the reviewer's settings, such as its endpoint, key, 
 | **Supervised**, **Auto**, **Auto-accept edits** | pi-auto-review reviews as above and asks you only in the cases above (high denials, anything critical, failed reviews, denials without a rating, its own files), in place of the bridge's own prompt on every call. The three modes behave the same: edits to ordinary files inside the working directory run without asking in each. |
 | **Full access** | Nothing asks. Each call waits for its review: a call rated critical (severe, lasting harm: data lost for good, secrets sent out, production changed, security weakened), or a call on pi-auto-review's own files, is blocked, and the rest run. A failed review, or a denial without a rating, runs and appears in the thread as a warning. |
 
-Its approvals appear in T3 Code like the bridge's own. It reads the same `models.json` as pi; to override it, set `PI_AUTO_REVIEW_MODEL` in the pi provider's environment in T3 Code's settings.
+Its approvals appear in T3 Code like the bridge's own. It reads the same `settings.json` and `models.json` as pi; to override them, set `PI_AUTO_REVIEW_MODEL` in the pi provider's environment in T3 Code's settings.
 
 ## Limits
 
