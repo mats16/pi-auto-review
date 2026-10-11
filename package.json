@@ -1,7 +1,7 @@
 {
   "name": "@mats16/pi-auto-review",
   "version": "0.1.0",
-  "description": "AI auto-review for pi tool calls: a reviewer model approves routine actions and asks you only about risky ones.",
+  "description": "AI auto-review for pi tool calls, after Codex's: a reviewer model approves routine actions and sends risky ones back to the agent.",
   "type": "module",
   "license": "MIT",
   "author": "mats16",
