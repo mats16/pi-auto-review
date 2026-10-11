@@ -39,7 +39,7 @@ The reviewer is the first of these that is set:
 2. The first model under the provider `pi-auto-review` in pi's `models.json`.
 3. The session's model.
 
-Reviews run at reasoning effort `high`, whatever thinking level the session uses, unless `PI_AUTO_REVIEW_MODEL` names another. Each review is one model request, typically 2–8 seconds; a fast, smaller model keeps pi responsive. [Reviewer benchmarks](docs/benchmarks.md) compares models and efforts by accuracy, speed, and cost.
+Reviews run at reasoning effort `high`, whatever thinking level the session uses, unless `PI_AUTO_REVIEW_MODEL` names another. Each review is one model request, typically 2–8 seconds; a fast, smaller model keeps pi responsive. [Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md) compares models and efforts by accuracy, speed, and cost.
 
 A provider of its own keeps the reviewer's settings, such as its endpoint, key, and `compat`, apart from the models your sessions use. The models under it also appear in `/model`. `models.json` is user-level only, so a project cannot change the reviewer:
 
