@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { homedir } from "node:os";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import autoReview, { needsReview, parseVerdict, reviewer, touches } from "./index.ts";
 
 const cwd = "/work/project";
+// The reviewer reads pi's user settings.json; keep the user's own out of every test.
+const agentDir = mkdtempSync(join(tmpdir(), "pi-agent-"));
+process.env.PI_CODING_AGENT_DIR = agentDir;
 
 test("needsReview skips read-only tools and ordinary edits inside cwd", () => {
 	assert.equal(needsReview("read", { path: "/etc/passwd" }, cwd), false);
@@ -69,29 +74,40 @@ test("touches catches calls on the extension's own files", () => {
 	assert.equal(touches(self, "read", { path: `${self}/index.ts` }, cwd), false);
 });
 
-test("reviewer takes PI_AUTO_REVIEW_MODEL, then the provider pi-auto-review in models.json, then the session's model", () => {
-	const listed = [
-		{ provider: "oss", id: "glm" },
-		{ provider: "pi-auto-review", id: "glm-flash" },
-	];
-	const ctx = (all: object[]) => ({ model: "session", modelRegistry: { getAll: () => all, find: (p: string, id: string) => `${p}/${id}` } }) as any;
-	const pick = (spec: string | undefined, all = listed) => {
+test("reviewer takes PI_AUTO_REVIEW_MODEL, then autoReview.model in the user's settings.json, then the session's model", () => {
+	const ctx = { model: "session", modelRegistry: { find: (p: string, id: string) => `${p}/${id}` } } as any;
+	const settings = (value: unknown) => writeFileSync(join(agentDir, "settings.json"), JSON.stringify(value));
+	const pick = (spec: string | undefined) => {
 		if (spec === undefined) delete process.env.PI_AUTO_REVIEW_MODEL;
 		else process.env.PI_AUTO_REVIEW_MODEL = spec;
 		try {
-			return reviewer(ctx(all));
+			const { model, reasoning } = reviewer(ctx);
+			return { model, reasoning };
 		} finally {
 			delete process.env.PI_AUTO_REVIEW_MODEL;
 		}
 	};
-	assert.deepEqual(pick(undefined), { model: listed[1], reasoning: "high" });
-	assert.deepEqual(pick(undefined, [listed[0], { provider: "proxy", id: "pi-auto-review" }]).model, "session"); // only the provider counts
-	assert.deepEqual(pick(undefined, [listed[0]]), { model: "session", reasoning: "high" });
-	assert.deepEqual(pick(""), { model: listed[1], reasoning: "high" });
-	assert.deepEqual(pick("openai/gpt-6-1-sol"), { model: "openai/gpt-6-1-sol", reasoning: "high" });
+	assert.deepEqual(pick(undefined), { model: "session", reasoning: "high" }); // no settings.json
+	settings({ theme: "dark" });
+	assert.deepEqual(pick(undefined), { model: "session", reasoning: "high" });
+	settings({ autoReview: { model: "" } });
+	assert.deepEqual(pick(undefined), { model: "session", reasoning: "high" });
+	settings({ autoReview: { model: "oss/glm-flash:low" } });
+	assert.deepEqual(pick(undefined), { model: "oss/glm-flash", reasoning: "low" });
+	assert.deepEqual(pick(""), { model: "oss/glm-flash", reasoning: "low" });
+	assert.deepEqual(pick("openai/gpt-6-1-sol"), { model: "openai/gpt-6-1-sol", reasoning: "high" }); // the variable wins
 	assert.deepEqual(pick("openai/gpt-6-1-sol:low"), { model: "openai/gpt-6-1-sol", reasoning: "low" });
 	assert.deepEqual(pick("ollama/qwen2.5-coder:7b"), { model: "ollama/qwen2.5-coder:7b", reasoning: "high" }); // ":7b" is part of the ID
 	assert.deepEqual(pick("gpt-6-1-sol"), { model: undefined, reasoning: "high" }); // no provider, a human decides
+	writeFileSync(join(agentDir, "settings.json"), `﻿${JSON.stringify({ autoReview: { model: "oss/glm:low" } })}`);
+	assert.deepEqual(pick(undefined), { model: "oss/glm", reasoning: "low" }); // pi drops a leading BOM
+	writeFileSync(join(agentDir, "settings.json"), "");
+	assert.deepEqual(pick(undefined), { model: "session", reasoning: "high" }); // pi reads an empty file as no settings
+	settings({ autoReview: { model: { id: "glm" } } });
+	assert.deepEqual(pick(undefined).model, undefined); // not a "provider/model" string, a human decides
+	writeFileSync(join(agentDir, "settings.json"), "{");
+	assert.throws(() => pick(undefined)); // unreadable, so review() sends the call to a human
+	rmSync(join(agentDir, "settings.json"));
 });
 
 /** Loads the extension as T3 Code would start pi in the given mode. */
@@ -111,7 +127,6 @@ function fakeCtx(text: string, seen: string[], hasUI = true) {
 		model: {},
 		sessionManager: { getBranch: () => [] },
 		modelRegistry: {
-			getAll: () => [],
 			streamSimple: (_model: unknown, _context: unknown, options: { reasoning?: string }) => ({
 				result: async () => (seen.push(`review:${options.reasoning}`), { stopReason: "stop", content: [{ type: "text", text }] }),
 			}),

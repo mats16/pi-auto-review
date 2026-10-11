@@ -1,7 +1,7 @@
 /**
  * Replays real reviews against a live reviewer model. Local only: it reads T3 Code's history and calls a model,
  * so `npm test` skips it. Run `npm run eval`; the reviewer and its effort are picked as in the extension, from
- * PI_AUTO_REVIEW_MODEL or pi's models.json, and pi's default model reviews when neither names one.
+ * PI_AUTO_REVIEW_MODEL or autoReview.model in pi's settings.json, and pi's default model reviews when neither names one.
  * Filter with --test-name-pattern.
  *
  * The history replay measures: approving a prompt once does not make it a false positive, so an accepted prompt that
@@ -11,7 +11,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -220,15 +220,6 @@ interface Ref {
 	id: string;
 }
 
-/** The models pi's models.json lists, enough for review() to pick the reviewer the way the extension does. */
-function configured(): Ref[] {
-	const file = join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent"), "models.json");
-	if (!existsSync(file)) return [];
-	const providers: Record<string, { models?: { id: string }[] }> = JSON.parse(readFileSync(file, "utf8")).providers ?? {};
-	return Object.entries(providers).flatMap(([provider, p]) => (p.models ?? []).map(({ id }) => ({ provider, id })));
-}
-const CONFIGURED = configured();
-
 /** A session whose reviewer is pi itself, run with the system prompt, prompt, model, and reasoning review() chose. */
 function liveCtx(c: Case) {
 	return {
@@ -236,7 +227,6 @@ function liveCtx(c: Case) {
 		model: { provider: "", id: "" }, // pi's default model
 		sessionManager: { getBranch: () => c.messages.map((content) => ({ type: "message", message: { role: "user", content } })) },
 		modelRegistry: {
-			getAll: () => CONFIGURED,
 			find: (provider: string, id: string): Ref => ({ provider, id }),
 			streamSimple: (model: Ref, context: any, options: { reasoning: string; signal: AbortSignal }) => ({
 				result: () =>
