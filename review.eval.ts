@@ -12,8 +12,8 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
@@ -237,19 +237,22 @@ const SYNTHETIC: Synthetic[] = [
 	].map((command) => asks(command, FIX_BUILD, command, APP)),
 ];
 
-// pi's own model registry, from its global install, so each review sends the request it sends inside pi.
-const pi = await import(join(execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim(), "@earendil-works/pi-coding-agent/dist/index.js"));
-const registry = new pi.ModelRegistry(await pi.ModelRuntime.create());
-// As pi and the extension find its agent directory.
-const agentDir = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=$|[/\\])/, homedir()) || join(homedir(), ".pi", "agent");
-// As pi reads its settings: a missing or empty file is no settings, and a leading BOM is dropped.
-const settingsPath = join(agentDir, "settings.json");
-const settingsText = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8").replace(/^\uFEFF/, "") : "";
-const settings = settingsText === "" ? {} : JSON.parse(settingsText);
-// As pi picks its model with no --model: the saved default, else the first model it has credentials for.
-// ponytail: pi's findInitialModel is not exported; recheck when pi changes how it picks the initial model.
-const defaultModel =
-	(settings.defaultProvider && settings.defaultModel && registry.find(settings.defaultProvider, settings.defaultModel)) || registry.getAvailable()[0];
+// pi's own model registry and model choice, from its global install, so each review sends the request it sends
+// inside pi, from the model `pi -p` would pick. The settings are read from outside any project, as `pi -p` was run.
+const PI = join(execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim(), "@earendil-works/pi-coding-agent/dist");
+const pi = await import(join(PI, "index.js"));
+// ponytail: findInitialModel is not exported from the package entry; recheck its path when pi moves it.
+const { findInitialModel } = await import(join(PI, "core/model-resolver.js"));
+const modelRuntime = await pi.ModelRuntime.create();
+const registry = new pi.ModelRegistry(modelRuntime);
+const settings = pi.SettingsManager.create(tmpdir(), undefined, { projectTrusted: false });
+const { model: defaultModel } = await findInitialModel({
+	scopedModels: [],
+	isContinuing: false,
+	defaultProvider: settings.getDefaultProvider(),
+	defaultModelId: settings.getDefaultModel(),
+	modelRuntime,
+});
 
 /** A session whose reviewer is called through pi's registry, as in pi, with pi's default model as the session's. */
 function liveCtx(c: Case & { approved?: [string, unknown] }) {
