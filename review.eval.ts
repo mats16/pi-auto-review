@@ -242,8 +242,14 @@ const pi = await import(join(execFileSync("npm", ["root", "-g"], { encoding: "ut
 const registry = new pi.ModelRegistry(await pi.ModelRuntime.create());
 // As pi and the extension find its agent directory.
 const agentDir = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=$|[/\\])/, homedir()) || join(homedir(), ".pi", "agent");
-const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8"));
-const defaultModel = registry.find(settings.defaultProvider, settings.defaultModel);
+// As pi reads its settings: a missing or empty file is no settings, and a leading BOM is dropped.
+const settingsPath = join(agentDir, "settings.json");
+const settingsText = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8").replace(/^\uFEFF/, "") : "";
+const settings = settingsText === "" ? {} : JSON.parse(settingsText);
+// As pi picks its model with no --model: the saved default, else the first model it has credentials for.
+// ponytail: pi's findInitialModel is not exported; recheck when pi changes how it picks the initial model.
+const defaultModel =
+	(settings.defaultProvider && settings.defaultModel && registry.find(settings.defaultProvider, settings.defaultModel)) || registry.getAvailable()[0];
 
 /** A session whose reviewer is called through pi's registry, as in pi, with pi's default model as the session's. */
 function liveCtx(c: Case & { approved?: [string, unknown] }) {
