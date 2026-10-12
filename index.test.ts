@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import autoReview, { approvalDetails, approvalMessage, needsReview, parseVerdict, reviewer, touches, transcript } from "./index.ts";
+import autoReview, { approvalDetails, approvalMessage, needsReview, parseVerdict, review, reviewer, touches, transcript } from "./index.ts";
 
 const cwd = "/work/project";
 // The reviewer reads pi's user settings.json; keep the user's own out of every test.
@@ -203,6 +203,28 @@ function fakeCtx(text: string, seen: string[], hasUI = true, approve = false) {
 	};
 }
 
+test("through OpenAI's Responses API, the reviewer's answer is held to the verdict's schema; other APIs answer in text", async () => {
+	const formatOf = async (api: string, samplingParams?: object) => {
+		let sent: any;
+		const ctx = {
+			cwd,
+			model: { api, samplingParams },
+			sessionManager: { getBranch: () => [] },
+			modelRegistry: {
+				streamSimple: (_model: unknown, _context: unknown, options: unknown) => ((sent = options), { result: async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"outcome":"allow"}' }] }) }),
+			},
+		};
+		assert.equal((await review(ctx as any, "bash", { command: "x" })).outcome, "allow");
+		return sent.samplingParams?.text;
+	};
+	const { format } = await formatOf("openai-responses");
+	assert.deepEqual([format.type, format.strict, format.schema.required], ["json_schema", true, ["risk_level", "user_authorization", "outcome", "rationale"]]);
+	// pi replaces the model's text settings with these wholesale, so they carry the model's own along.
+	assert.equal((await formatOf("azure-openai-responses", { text: { verbosity: "low" } })).verbosity, "low");
+	assert.equal(await formatOf("anthropic-messages"), undefined);
+	assert.equal(await formatOf("openai-completions"), undefined); // its body has no text field to take it
+});
+
 /** Runs one bash call under a T3 mode, with a reviewer that answers the given verdict. */
 async function runCall(mode: string | undefined, verdict: object | string, command = "x", hasUI = true) {
 	const handlers = load(mode);
@@ -249,14 +271,14 @@ test("calls on the extension's own files skip the reviewer and go to a human, sh
 });
 
 test("a call too large for the reviewer to see whole goes to the user, never to the reviewer", async () => {
-	const command = `cat > big.sh <<'E'\n${"echo ok\n".repeat(1_000)}E\nrm -rf ~`;
+	const command = `cat > big.sh <<'E'\n${"echo ok\n".repeat(4_000)}E\nrm -rf ~`;
 	const asked = await runCall("approval-required", { outcome: "allow" }, command);
 	assert.deepEqual([asked.blocked, asked.seen], [true, ["confirm"]]);
 	assert.match(confirmed!.at(-1)!, /rm -rf ~/); // the user sees all of it
 	const headless = await runCall(undefined, { outcome: "allow" }, command, false);
 	assert.deepEqual([headless.blocked, headless.seen], [true, []]);
 	assert.match(headless.reason, /too large to review/);
-	const fits = await runCall(undefined, { outcome: "allow" }, "echo ok\n".repeat(800));
+	const fits = await runCall(undefined, { outcome: "allow" }, "echo ok\n".repeat(3_000));
 	assert.deepEqual([fits.blocked, fits.seen], [false, ["review:high"]]);
 });
 

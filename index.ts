@@ -15,7 +15,8 @@
  * In T3 Code it reviews only in Supervised and Auto-accept edits, in place of the bridge's own prompts. In Full access
  * everything runs unreviewed, as in Codex, and any other mode keeps the bridge's prompts.
  * The reviewer is PI_AUTO_REVIEW_MODEL, else autoReview.model in pi's user settings.json, else the session's model, run
- * at reasoning effort high unless the one named gives another.
+ * at reasoning effort high unless the one named gives another. Through OpenAI's Responses API, its answer is held to
+ * the verdict's JSON schema; other APIs answer in plain text.
  */
 
 import { readFileSync } from "node:fs";
@@ -31,7 +32,7 @@ const FILE_TOOLS = new Set(["edit", "write"]);
 const TIMEOUT_MS = 90_000;
 const REASONING = "high";
 const MAX_CHARS = 4_000;
-const MAX_CALL_CHARS = 8_000;
+const MAX_CALL_CHARS = 32_000;
 const MAX_ENTRY_CHARS = 2_000;
 const MAX_TRANSCRIPT_CHARS = 48_000;
 const RISKS = new Set(["low", "medium", "high", "critical"]);
@@ -40,6 +41,25 @@ const MAX_CONSECUTIVE_DENIALS = 3;
 const MAX_RECENT_DENIALS = 10;
 const DENIAL_WINDOW = 50;
 const MAX_LISTED_DENIALS = 10;
+/** The verdict's shape, which OpenAI's Responses API enforces, so the reviewer cannot answer anything else. */
+const VERDICT_FORMAT = {
+	type: "json_schema",
+	name: "verdict",
+	strict: true,
+	schema: {
+		type: "object",
+		additionalProperties: false,
+		required: ["risk_level", "user_authorization", "outcome", "rationale"],
+		properties: {
+			risk_level: { type: "string", enum: [...RISKS] },
+			user_authorization: { type: "string", enum: [...AUTHORIZATIONS] },
+			outcome: { type: "string", enum: ["allow", "deny"] },
+			rationale: { type: "string" },
+		},
+	},
+};
+// ponytail: other APIs answer in plain text, where other JSON beside the verdict makes it unreadable and blocks the call.
+const STRUCTURED_APIS = new Set(["openai-responses", "azure-openai-responses"]);
 /** The custom message /auto-review sends; the reviewer trusts it as the user's approval. */
 const APPROVAL = "pi-auto-review-approval";
 // What Codex tells its agent after a denial, and after a review that did not complete.
@@ -110,6 +130,13 @@ the agent is told your rationale and must take a materially safer route or get t
 - A read-only call (a search, a lookup, a fetched page, an item listed or read, through any tool) is "low" whatever
   query, term, or source the agent chose, unless a rule below applies to it, such as private data in a query to a
   service not already connected, or credential probing. The agent picks these itself as it works.
+- Among the host app's own tools (mcp__t3-code__*), previewing and rendering the pages it shows the user, reading,
+  listing, and status checks, delegating, and linking PRs are "low", unless a rule below applies, such as secrets in
+  the payload. Its other tools (driving the browser, answering pending requests, changing projects, threads,
+  schedules, or preferences) are judged by the rules below.
+- Writing or overwriting a file under a literal /tmp path (or /private/tmp) with no ".." in it is scratch work and
+  "low", unless a rule below applies, such as credentials obtained by probing; a script written there is not risky
+  for what it would do: running it is judged by that.
 - Do not assign "high" or "critical" solely because a path is outside the working directory, a job is large or
   long-running, a command retries one that failed, or a deletion uses rm -rf on a specific path the user named.
 - Before rating a network call "high" or "critical", identify what data actually leaves: file contents, secrets,
@@ -370,7 +397,12 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 			.streamSimple(
 				model,
 				{ systemPrompt: POLICY, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-				{ reasoning, signal },
+				{
+					reasoning,
+					signal,
+					// pi merges samplingParams shallowly over the model's, so keep the model's other text settings.
+					...(STRUCTURED_APIS.has(model.api) && { samplingParams: { text: { ...(model.samplingParams?.text as object), format: VERDICT_FORMAT } } }),
+				},
 			)
 			.result();
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
