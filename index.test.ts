@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import autoReview, { approvalDetails, approvalMessage, triageModel, triageState, needsReview, parseVerdict, review, reviewer, routine, touches, transcript } from "./index.ts";
@@ -270,8 +270,8 @@ test("triageState gives the triage model only the trusted entries and the call, 
 const MAX_CALL_FOR_TEST = 33_000; // over the 32,000-character limit, so the user is asked
 
 /** A session with the triage model turned on: classify answers as given (or throws), and the reviewer allows. */
-async function triaged(classify: () => Promise<object>, triage: object = {}, signal?: AbortSignal) {
-	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { triage: { enabled: true, model: "typesafe/jev-latest", ...triage } } }));
+async function triaged(classify: () => Promise<object>, triage: object = {}, signal?: AbortSignal, own: object = {}) {
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { ...own, triage: { enabled: true, model: "typesafe/jev-latest", ...triage } } }));
 	const seen: string[] = [];
 	const ctx: any = fakeCtx('{"outcome":"allow"}', seen);
 	ctx.modelRegistry.findOfType = () => ({ type: "classifier", api: "typesafe-system-one" });
@@ -310,6 +310,46 @@ test("a routine call the triage model clears runs without the reviewer; anything
 	const off = await triaged(async () => answers({ read: 1 }), { model: "jev-latest" });
 	assert.deepEqual(off.seen, ["review:high"]);
 	assert.match(off.verdict.warning!, /triage model is off/);
+});
+
+test("autoReview.log appends each review to pi-auto-review.jsonl: who decided, the triage answers, the reviewer's time and tokens", async () => {
+	const file = join(agentDir, "pi-auto-review.jsonl");
+	try {
+		await triaged(async () => answers({ read: 0.9, others: 0.1 }));
+		assert.equal(existsSync(file), false); // off by default
+		await triaged(async () => answers({ read: 0.9, others: 0.1 }), {}, undefined, { log: true });
+		await triaged(async () => answers({ destroy: 0.9, read: 0.1 }), {}, undefined, { log: true });
+		await triaged(async () => {
+			throw new Error("429");
+		}, {}, undefined, { log: true });
+		const [cleared, reviewed, failed] = readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		rmSync(file);
+		assert.deepEqual([cleared.by, cleared.tool, cleared.call, cleared.outcome, cleared.triage.routine, cleared.reviewer], ["triage", "bash", "ls", "allow", true, undefined]);
+		assert.equal(cleared.triage.answers.kind.probabilities.read, 0.9);
+		assert.equal(typeof cleared.triage.ms, "number");
+		assert.deepEqual([reviewed.by, reviewed.triage.routine, reviewed.reviewer.effort, reviewed.reviewer.usage], ["reviewer", false, "high", { input: 10, output: 2 }]);
+		assert.equal(typeof reviewed.reviewer.ms, "number");
+		assert.deepEqual([failed.by, failed.triage.error], ["reviewer", "429"]); // the error itself, not the warning around it
+		// Past 5 MB, as pi's mcp.log, the file moves to .1, replacing the one before, and the next review starts a new one.
+		writeFileSync(`${file}.1`, "old\n");
+		writeFileSync(file, "x".repeat(5 * 1024 * 1024 + 1));
+		await triaged(async () => answers({ read: 0.9, others: 0.1 }), {}, undefined, { log: true });
+		assert.equal(readFileSync(`${file}.1`, "utf8").length, 5 * 1024 * 1024 + 1);
+		assert.equal(JSON.parse(readFileSync(file, "utf8")).by, "triage");
+		assert.equal(statSync(file).mode & 0o777, 0o600); // it holds the calls, secrets included
+		rmSync(file);
+		// After a block, the line says why the triage model was not asked.
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { log: true, triage: { enabled: true, model: "typesafe/jev-latest" } } }));
+		await review(fakeCtx('{"outcome":"allow"}', []) as any, "bash", { command: "ls" }, { triage: false });
+		assert.deepEqual([JSON.parse(readFileSync(file, "utf8")).triage, JSON.parse(readFileSync(file, "utf8")).by], ["skipped after a block", "reviewer"]);
+		rmSync(file);
+		// A log that cannot be written leaves the verdict as it was.
+		mkdirSync(file);
+		assert.equal((await review(fakeCtx('{"outcome":"allow"}', []) as any, "bash", { command: "ls" })).outcome, "allow");
+	} finally {
+		// Left behind, these would turn triage and logging on for the tests after this one.
+		for (const path of [file, `${file}.1`, join(agentDir, "settings.json")]) rmSync(path, { recursive: true, force: true });
+	}
 });
 
 test("a triage model outside pi's catalog is called at its endpoint, as is, as System One, with its provider's credentials", async () => {
@@ -370,7 +410,7 @@ function fakeCtx(text: string, seen: string[], hasUI = true, approve = false) {
 		sessionManager: { getBranch: () => [] },
 		modelRegistry: {
 			streamSimple: (_model: unknown, _context: unknown, options: { reasoning?: string }) => ({
-				result: async () => (seen.push(`review:${options.reasoning}`), { stopReason: "stop", content: [{ type: "text", text }] }),
+				result: async () => (seen.push(`review:${options.reasoning}`), { stopReason: "stop", content: [{ type: "text", text }], usage: { input: 10, output: 2 } }),
 			}),
 		},
 		ui: {

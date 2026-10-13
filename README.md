@@ -93,6 +93,29 @@ All three keep most reviews under a second. Higher values also move the calls th
 
 [Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#triage-model) has its accuracy, speed, and cost in front of a reviewer.
 
+### Review log (off by default)
+
+`"log": true` in `autoReview` appends one JSON line per review to `pi-auto-review.jsonl` in pi's agent directory (`~/.pi/agent/`), next to pi's own `mcp.log` and `pi-debug.log`, to see how many calls the triage model clears and how the reviewer responds. As with `mcp.log`, past 5 MB the file moves to `pi-auto-review.jsonl.1`, replacing the one before. Calls that run or go to you without review are not logged.
+
+```json
+{ "autoReview": { "model": "databricks-oss/system.ai.glm-5-3-flash", "log": true } }
+```
+
+| Field | Meaning |
+|---|---|
+| `time`, `session`, `cwd`, `tool`, `call` | When the review started, in which session, and the call (a bash command as is, clipped to 500 characters). `npm run eval` leaves `session` out. |
+| `outcome`, `risk`, `authorization`, `reason` | The verdict. `risk` is `unknown` when the review failed. |
+| `by` | `triage` when the triage model cleared the call, `reviewer` when the reviewer was asked. Missing when neither answered: no reviewer model was found, or the session was aborted during triage. |
+| `ms` | The whole review, in milliseconds. |
+| `triage` | `model`, `ms`, `routine`, and its `answers` (probabilities), or its `error` message; `"skipped after a block"` when a block earlier in the run left the call to the reviewer. |
+| `reviewer` | `model`, `effort`, `ms`, and `usage` (tokens and cost, as the provider reports them). |
+
+```bash
+# How many reviews each side decided, and the reviewer's median time
+jq -s 'group_by(.by) | map({by: .[0].by, n: length})' ~/.pi/agent/pi-auto-review.jsonl
+jq -s '[.[] | .reviewer.ms // empty] | sort | .[length/2|floor]' ~/.pi/agent/pi-auto-review.jsonl
+```
+
 ## T3 Code
 
 | Mode | What happens |
@@ -123,6 +146,7 @@ T3 Code starts pi in **Auto** as it does in Supervised, so pi-auto-review review
 - The triage model sees only your messages and the call. Until a call is blocked in the run, it cannot see what the agent did before, such as a script it wrote that the call runs.
 - The triage model reads the call's text, which the agent wrote, and small classifiers do not treat it as hostile: text in a call can talk it into rating the call routine, and the call then runs without the reviewer. It also sees only your messages and the call, not the agent's words or tool output, so it cannot tell when untrusted content steered the agent; the reviewer can. This is why it is off by default.
 - The triage model's questions were tuned on the eval's own cases, and the default `confidence` and the 0.2 for its two flags were chosen on its answers to those, the history, and cases written later; few of the calls that should ask came close. Its answers shift with the order of their options and the model's version. Rerun `npm run eval` when you change either.
+- The review log keeps each call as the agent wrote it, and the reviewer's reason, which can quote it, secrets included: delete `pi-auto-review.jsonl` and its `.1` to start over. Only you can read a file it creates. It keeps at most about 10 MB, so older reviews are lost; copy the `.1` away to keep them. Two pi processes rotating it at the same moment can replace the full `.1` with a nearly empty one. A failed write is skipped without notice.
 - Databricks limits OpenJev's input tokens per minute for a workspace. Over the limit, the reviewer judges the calls, so reviews slow down but do not fail.
 
 ## Development
