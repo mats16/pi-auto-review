@@ -337,6 +337,28 @@ test("autoReview.log appends each review to pi-auto-review.jsonl: who decided, t
 		assert.equal(readFileSync(`${file}.1`, "utf8").length, 5 * 1024 * 1024 + 1);
 		assert.equal(JSON.parse(readFileSync(file, "utf8")).by, "triage");
 		assert.equal(statSync(file).mode & 0o777, 0o600); // it holds the calls, secrets included
+		// A file that cannot be moved to .1 stops growing: the review goes unlogged.
+		rmSync(`${file}.1`);
+		mkdirSync(join(`${file}.1`, "full"), { recursive: true });
+		writeFileSync(file, "x".repeat(5 * 1024 * 1024 + 1));
+		assert.equal((await triaged(async () => answers({ read: 0.9, others: 0.1 }), {}, undefined, { log: true })).verdict.outcome, "allow");
+		assert.equal(statSync(file).size, 5 * 1024 * 1024 + 1);
+		rmSync(`${file}.1`, { recursive: true });
+		rmSync(file);
+		// A long reason or triage error, such as a gateway's error page, is clipped.
+		await triaged(async () => {
+			throw new Error("e".repeat(10_000));
+		}, {}, undefined, { log: true });
+		assert.ok(JSON.parse(readFileSync(file, "utf8")).triage.error.length < 600);
+		rmSync(file);
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { log: true } }));
+		await review(fakeCtx(JSON.stringify({ outcome: "deny", rationale: "y".repeat(10_000) }), []) as any, "bash", { command: "ls" });
+		assert.ok(JSON.parse(readFileSync(file, "utf8")).reason.length < 600);
+		rmSync(file);
+		// Past 16,000 characters, whatever made it long, the line keeps only the verdict.
+		await triaged(async () => ({ ...answers({ read: 0.9, others: 0.1 }), junk: { probability: 0, text: "z".repeat(20_000) } }), {}, undefined, { log: true });
+		const oversized = JSON.parse(readFileSync(file, "utf8"));
+		assert.deepEqual([oversized.by, oversized.outcome, oversized.tool, oversized.triage, oversized.oversized > 20_000], ["triage", "allow", "bash", undefined, true]);
 		rmSync(file);
 		// After a block, the line says why the triage model was not asked.
 		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { log: true, triage: { enabled: true, model: "typesafe/jev-latest" } } }));
