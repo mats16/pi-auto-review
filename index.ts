@@ -510,15 +510,19 @@ export function triageState(lines: string[], cwd: string, toolName: string, inpu
 
 /**
  * Whether the triage model's answers let a call run without the reviewer: its likeliest kind is routine, the routine
- * kinds together reach the confidence, and it sees no secret in the call and no instruction to skip asking.
+ * kinds together reach the confidence, and it sees no secret in the call and no instruction to skip asking. Only well-
+ * formed probabilities count, from 0 to 1 and summing to at most 1, so a malformed answer goes to the reviewer.
  */
 export function routine(answers: Answers, confidence: number): boolean {
-	// Only finite numbers count: a probability that is missing or not a number (a gateway's "0.1") clears nothing.
-	const number = (p: unknown) => (typeof p === "number" && Number.isFinite(p) ? p : undefined);
-	const kind = answers.kind;
-	const sum = ROUTINE_KINDS.reduce((n, k) => n + (number(kind?.probabilities?.[k]) ?? 0), 0);
-	const clear = (q: string) => (number(answers[q]?.probability) ?? 1) < TRIAGE_FLAG;
-	return ROUTINE_KINDS.includes(String(kind?.choice)) && sum >= confidence && clear("has_secret") && clear("loosens");
+	const probability = (p: unknown) => (typeof p === "number" && p >= 0 && p <= 1 ? p : undefined);
+	const kinds = Object.entries(answers.kind?.probabilities ?? {});
+	if (kinds.length === 0 || kinds.some(([, p]) => probability(p) === undefined)) return false;
+	if (kinds.reduce((n, [, p]) => n + p, 0) > 1 + 1e-6) return false;
+	// The likeliest kind from the probabilities themselves, not the answer's "choice"; a tie goes to the reviewer.
+	const best = (isRoutine: boolean) => Math.max(0, ...kinds.filter(([k]) => ROUTINE_KINDS.includes(k) === isRoutine).map(([, p]) => p));
+	const sum = kinds.reduce((n, [k, p]) => n + (ROUTINE_KINDS.includes(k) ? p : 0), 0);
+	const clear = (q: string) => (probability(answers[q]?.probability) ?? 1) < TRIAGE_FLAG;
+	return best(true) > best(false) && sum >= confidence && clear("has_secret") && clear("loosens");
 }
 
 /** Reviews one call. `triage: false` leaves it to the reviewer even when a triage model is on. */

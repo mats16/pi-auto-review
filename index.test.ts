@@ -188,6 +188,13 @@ test("routine lets a call skip the reviewer only when its likeliest kind is rout
 	// Only finite numbers count, so a gateway's string "0.1" clears no flag and adds nothing to the routine kinds.
 	assert.equal(routine({ ...answers({ read: 0.9, others: 0.1 }), has_secret: { probability: "0.1" as any } }, 0.5), false);
 	assert.equal(routine({ ...answers({ read: 0.9, others: 0.1 }), kind: { choice: "read", probabilities: { read: "0.9" as any } } }, 0.5), false);
+	// Only probabilities from 0 to 1, summing to at most 1: a malformed answer goes to the reviewer.
+	assert.equal(routine(answers({ read: 2 }, { has_secret: -1, loosens: -1 }), 0.5), false);
+	assert.equal(routine(answers({ read: 0.9, others: 0.1 }, { has_secret: -1 }), 0.5), false);
+	assert.equal(routine(answers({ read: 0.7, edit: 0.7 }), 0.5), false);
+	// The likeliest kind comes from the probabilities, not the answer's choice, and a tie is not routine.
+	assert.equal(routine({ ...answers({ read: 0.3, edit: 0.3, destroy: 0.4 }), kind: { choice: "read", probabilities: { read: 0.3, edit: 0.3, destroy: 0.4 } } }, 0.5), false);
+	assert.equal(routine(answers({ read: 0.5, destroy: 0.5 }), 0.5), false);
 });
 
 test("triageModel is off unless autoReview.triage.enabled is true, and reports a setting it cannot use", () => {
