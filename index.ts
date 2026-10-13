@@ -18,9 +18,10 @@
  * at reasoning effort high unless the one named, or autoReview.effort, gives another. Through OpenAI's Responses API,
  * its answer is held to the verdict's JSON schema; other APIs answer in plain text.
  * With autoReview.triage turned on, a classifier (the triage model, such as TypeSafe's Jev) sees the user's
- * messages and the call first: a call it finds routine with enough confidence runs without the reviewer, and anything
- * else, or its failure, goes to the reviewer. It can only let a call run, never block one, and after any call is
- * blocked, the rest of that run goes to the reviewer alone. It is off by default.
+ * messages and the call first: a call it finds routine with a probability of at least 0.6, and routine rather than its
+ * likeliest risk (probability its answer leaves out counts as one) with enough confidence, runs without the reviewer, and
+ * anything else, or its failure, goes to the reviewer. It can only let a call run, never block one, and after any call
+ * is blocked, the rest of that run goes to the reviewer alone. It is off by default.
  */
 
 import { readFileSync } from "node:fs";
@@ -37,11 +38,18 @@ const TIMEOUT_MS = 90_000;
 const REASONING = "high";
 const LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 const TRIAGE_TIMEOUT_MS = 10_000;
-// Measured from 0.5 to 0.8 in front of GLM-5.3-Flash (docs/benchmarks.md): the triage model let nothing wrong through
-// at any of them, and 0.6 keeps a margin over 0.5 for about 8 points fewer history reviews cleared.
-const TRIAGE_CONFIDENCE = 0.6;
-/** At or above this, the triage model's has_secret or loosens answer leaves the call to the reviewer. */
-const TRIAGE_FLAG = 0.3;
+// Measured on OpenJev's answers to the eval's cases, its history, and cases written after the questions
+// (docs/benchmarks.md): 0.75, routine three times as likely as the likeliest risk, clears nearly as many history
+// reviews as the old rule did and leaves the closest call that should ask 0.5 logit short of clearing. At 0.6 one cleared.
+const TRIAGE_CONFIDENCE = 0.75;
+const TRIAGE_MIN_CONFIDENCE = 0.7;
+// The routine kinds must also reach this, so a risk spread over several kinds, small against the likeliest risk alone,
+// adds up to at most 0.4, as under the old rule's default. Measured as above, it costs one history review in 78.
+const TRIAGE_ROUTINE = 0.6;
+// At or above this, the triage model's has_secret or loosens answer leaves the call to the reviewer. Measured as above:
+// 99% of the calls that should run were under 0.21 and 0.25, and the calls with a secret or a loosened rule were at
+// least 0.35 and 0.41; 0.3 left the lowest of those 0.2 logit from clearing.
+const TRIAGE_FLAG = 0.2;
 /** The kinds of call the triage model may let run: as POLICY has it, routine work. */
 const ROUTINE_KINDS = ["read", "edit", "connected"];
 const MAX_CHARS = 4_000;
@@ -446,7 +454,7 @@ export function triageModel(ctx: ExtensionContext, own: Settings = settings()): 
 	const slash = spec.indexOf("/");
 	if (slash <= 0) return { error: `autoReview.triage.model must be "provider/model-id", not ${JSON.stringify(triage.model)}.` };
 	const confidence = triage.confidence ?? TRIAGE_CONFIDENCE;
-	if (typeof confidence !== "number" || !(confidence > 0 && confidence <= 1)) return { error: "autoReview.triage.confidence must be a number above 0 and at most 1." };
+	if (typeof confidence !== "number" || !(confidence >= TRIAGE_MIN_CONFIDENCE && confidence <= 1)) return { error: `autoReview.triage.confidence must be a number from ${TRIAGE_MIN_CONFIDENCE} to 1.` };
 	const [provider, id] = [spec.slice(0, slash), spec.slice(slash + 1)];
 	const listed = ctx.modelRegistry.findOfType?.("classifier", provider, id);
 	if (listed !== undefined) {
@@ -509,20 +517,34 @@ export function triageState(lines: string[], cwd: string, toolName: string, inpu
 }
 
 /**
- * Whether the triage model's answers let a call run without the reviewer: its likeliest kind is routine, the routine
- * kinds together reach the confidence, and it sees no secret in the call and no instruction to skip asking. Only well-
- * formed probabilities count, from 0 to 1 and summing to at most 1, so a malformed answer goes to the reviewer.
+ * Whether the triage model's answers let a call run without the reviewer: the routine kinds, which all run and so count
+ * as one answer, reach TRIAGE_ROUTINE, and against the likeliest risky kind they take at least the confidence, as in
+ * TypeSafe's top-to-second ratio; and it sees no secret in the call and no instruction to skip asking. Only well-formed
+ * probabilities count, from 0 to 1 and summing to at most 1, so a malformed answer goes to the reviewer.
  */
 export function routine(answers: Answers, confidence: number): boolean {
 	const probability = (p: unknown) => (typeof p === "number" && p >= 0 && p <= 1 ? p : undefined);
 	const kinds = Object.entries(answers.kind?.probabilities ?? {});
 	if (kinds.length === 0 || kinds.some(([, p]) => probability(p) === undefined)) return false;
-	if (kinds.reduce((n, [, p]) => n + p, 0) > 1 + 1e-6) return false;
-	// The likeliest kind from the probabilities themselves, not the answer's "choice"; a tie goes to the reviewer.
-	const best = (isRoutine: boolean) => Math.max(0, ...kinds.filter(([k]) => ROUTINE_KINDS.includes(k) === isRoutine).map(([, p]) => p));
+	// Sums of probabilities carry rounding (0.7 + 0.2 + 0.1 is 0.9999999999999999), so each comparison below allows
+	// for it in the direction that gives exact values their meaning: a call exactly at TRIAGE_ROUTINE or at the
+	// confidence is routine, and a total of exactly 1 leaves nothing out.
+	const rounding = 1e-6;
+	const total = kinds.reduce((n, [, p]) => n + p, 0);
+	if (total > 1 + rounding) return false;
+	// From the probabilities themselves, not the answer's "choice". Against the likeliest risk alone, a risk spread over
+	// several kinds would look small, so the routine kinds must also reach TRIAGE_ROUTINE.
+	// Probability the answer leaves out counts as one more risk.
 	const sum = kinds.reduce((n, [k, p]) => n + (ROUTINE_KINDS.includes(k) ? p : 0), 0);
+	const risk = Math.max(0, 1 - total - rounding, ...kinds.filter(([k]) => !ROUTINE_KINDS.includes(k)).map(([, p]) => p));
 	const clear = (q: string) => (probability(answers[q]?.probability) ?? 1) < TRIAGE_FLAG;
-	return best(true) > best(false) && sum >= confidence && clear("has_secret") && clear("loosens");
+	return sum + rounding >= TRIAGE_ROUTINE && sum + rounding >= confidence * (sum + risk) && clear("has_secret") && clear("loosens");
+}
+
+/** The routine kind the triage model rated likeliest, to name in the verdict: its "choice" can be a risky kind. */
+function likeliestRoutine(answers: Answers): string {
+	const p = answers.kind?.probabilities ?? {};
+	return ROUTINE_KINDS.reduce((best, k) => ((p[k] ?? 0) > (p[best] ?? 0) ? k : best));
 }
 
 /** Reviews one call. `triage: false` leaves it to the reviewer even when a triage model is on. */
@@ -550,7 +572,7 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 				{ state: triageState(lines, ctx.cwd, toolName, input), questions: TRIAGE_QUESTIONS },
 				ctx.signal ? AbortSignal.any([timeout, ctx.signal]) : timeout,
 			);
-			if (routine(answers, triage.confidence)) return { outcome: "allow", risk: "low", authorization: "unknown", reason: `Routine (${triage.spec}: ${answers.kind.choice}).` };
+			if (routine(answers, triage.confidence)) return { outcome: "allow", risk: "low", authorization: "unknown", reason: `Routine (${triage.spec}: ${likeliestRoutine(answers)}).` };
 		} catch (error) {
 			// The session's own abort is not a triage failure: it would show a false warning and use up the only one.
 			if (ctx.signal?.aborted) return unreviewed("Review failed: aborted");

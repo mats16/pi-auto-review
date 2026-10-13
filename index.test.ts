@@ -176,25 +176,42 @@ const answers = (kind: Record<string, number>, flags: { has_secret?: number; loo
 	loosens: { probability: flags.loosens ?? 0.05 },
 });
 
-test("routine lets a call skip the reviewer only when its likeliest kind is routine, the routine kinds reach the confidence, and no flag is raised", () => {
-	assert.equal(routine(answers({ read: 0.4, edit: 0.3, destroy: 0.3 }), 0.5), true);
-	assert.equal(routine(answers({ read: 0.4, edit: 0.3, destroy: 0.3 }), 0.8), false); // below the confidence asked for
-	// The routine kinds add up to 0.53, but the likeliest is destroy: as with `cd /tmp/x; rm -f *` in the history.
-	assert.equal(routine(answers({ destroy: 0.34, connected: 0.26, edit: 0.15, read: 0.12, others: 0.13 }), 0.5), false);
-	assert.equal(routine(answers({ connected: 0.9, others: 0.1 }, { has_secret: 0.41 }), 0.5), false); // a key in a search query
-	assert.equal(routine(answers({ edit: 0.9, weaken: 0.1 }, { loosens: 0.3 }), 0.5), false); // a skill told to skip asking
-	assert.equal(routine({ kind: { choice: "read", probabilities: { read: 1 } } }, 0.5), false); // a flag left unanswered
-	assert.equal(routine({}, 0.5), false);
+test("routine lets a call skip the reviewer only when the routine kinds reach 0.6, beat the likeliest risk by the confidence, and no flag is raised", () => {
+	// The routine kinds count as one answer however they split: 0.7 against destroy's 0.2 is 0.78.
+	assert.equal(routine(answers({ read: 0.25, edit: 0.25, connected: 0.2, destroy: 0.2, others: 0.1 }), 0.75), true);
+	assert.equal(routine(answers({ read: 0.25, edit: 0.25, connected: 0.2, destroy: 0.2, others: 0.1 }), 0.8), false);
+	// The routine kinds add up to 0.53 against destroy's 0.34, 0.61: as with `cd /tmp/x; rm -f *` in the history.
+	assert.equal(routine(answers({ destroy: 0.34, connected: 0.26, edit: 0.15, read: 0.12, others: 0.13 }), 0.75), false);
+	// A risk spread over many kinds: 0.45 is 0.82 against each, but less likely than all of them together.
+	assert.equal(routine(answers({ read: 0.45, destroy: 0.1, others: 0.1, install: 0.1, weaken: 0.1, data_out: 0.1, credentials: 0.05 }), 0.75), false);
+	assert.equal(routine(answers({ connected: 0.9, others: 0.1 }, { has_secret: 0.35 }), 0.75), false); // a key in a search query
+	assert.equal(routine(answers({ edit: 0.9, weaken: 0.1 }, { loosens: 0.2 }), 0.75), false); // a skill told to skip asking
+	assert.equal(routine(answers({ read: 0.9, others: 0.1 }, { has_secret: 0.19, loosens: 0.19 }), 0.75), true);
+	assert.equal(routine(answers({ read: 1 }), 1), true);
+	// Rounding in the sums neither invents a missing risk nor tips a call that sits exactly on the confidence.
+	assert.equal(routine(answers({ read: 0.7, edit: 0.2, connected: 0.1 }), 1), true);
+	assert.equal(routine(answers({ read: 0.6, destroy: 0.2, others: 0.2 }), 0.75), true);
+	assert.equal(routine(answers({ read: 0.59, destroy: 0.21, others: 0.2 }), 0.75), false);
+	// A risk spread over several kinds: 0.52 is 0.76 against each, but the risks add up to 0.48.
+	assert.equal(routine(answers({ read: 0.52, destroy: 0.16, install: 0.16, data_out: 0.16 }), 0.75), false);
+	// These routine kinds add up to 0.6 with rounding (0.5999999999999999): exactly at the floor.
+	assert.equal(routine(answers({ read: 0.03, edit: 0.282, connected: 0.288, destroy: 0.1, others: 0.1, install: 0.1, weaken: 0.1 }), 0.75), true);
+	assert.equal(routine({ kind: { choice: "read", probabilities: { read: 1 } } }, 0.75), false); // a flag left unanswered
+	assert.equal(routine({}, 0.75), false);
 	// Only finite numbers count, so a gateway's string "0.1" clears no flag and adds nothing to the routine kinds.
-	assert.equal(routine({ ...answers({ read: 0.9, others: 0.1 }), has_secret: { probability: "0.1" as any } }, 0.5), false);
-	assert.equal(routine({ ...answers({ read: 0.9, others: 0.1 }), kind: { choice: "read", probabilities: { read: "0.9" as any } } }, 0.5), false);
+	assert.equal(routine({ ...answers({ read: 0.9, others: 0.1 }), has_secret: { probability: "0.1" as any } }, 0.75), false);
+	assert.equal(routine({ ...answers({ read: 0.9, others: 0.1 }), kind: { choice: "read", probabilities: { read: "0.9" as any } } }, 0.75), false);
 	// Only probabilities from 0 to 1, summing to at most 1: a malformed answer goes to the reviewer.
-	assert.equal(routine(answers({ read: 2 }, { has_secret: -1, loosens: -1 }), 0.5), false);
-	assert.equal(routine(answers({ read: 0.9, others: 0.1 }, { has_secret: -1 }), 0.5), false);
-	assert.equal(routine(answers({ read: 0.7, edit: 0.7 }), 0.5), false);
-	// The likeliest kind comes from the probabilities, not the answer's choice, and a tie is not routine.
-	assert.equal(routine({ ...answers({ read: 0.3, edit: 0.3, destroy: 0.4 }), kind: { choice: "read", probabilities: { read: 0.3, edit: 0.3, destroy: 0.4 } } }, 0.5), false);
-	assert.equal(routine(answers({ read: 0.5, destroy: 0.5 }), 0.5), false);
+	assert.equal(routine(answers({ read: 2 }, { has_secret: -1, loosens: -1 }), 0.75), false);
+	assert.equal(routine(answers({ read: 0.9, others: 0.1 }, { has_secret: -1 }), 0.75), false);
+	assert.equal(routine(answers({ read: 0.7, edit: 0.7 }), 0.75), false);
+	// The probabilities decide, not the answer's choice; an even split is not routine, and a kind it does not know is a risk.
+	assert.equal(routine({ ...answers({ destroy: 0.9, read: 0.1 }), kind: { choice: "read", probabilities: { destroy: 0.9, read: 0.1 } } }, 0.75), false);
+	assert.equal(routine(answers({ read: 0.5, destroy: 0.5 }), 0.7), false);
+	assert.equal(routine(answers({ read: 0.7, upload: 0.3 }), 0.75), false);
+	// Probability left out of the answer is a risk too: 0.55 against the 0.4 missing is 0.58.
+	assert.equal(routine(answers({ read: 0.55, destroy: 0.05 }), 0.75), false);
+	assert.equal(routine(answers({ read: 0.85, destroy: 0.05 }), 0.75), true);
 });
 
 test("triageModel is off unless autoReview.triage.enabled is true, and reports a setting it cannot use", () => {
@@ -216,18 +233,21 @@ test("triageModel is off unless autoReview.triage.enabled is true, and reports a
 	assert.equal(triageOf({ model: "typesafe/jev-latest" }), undefined); // off until turned on
 	assert.equal(triageOf({ enabled: false, model: "typesafe/jev-latest" }), undefined);
 	assert.equal(triageOf({ enabled: "true", model: "typesafe/jev-latest" }), undefined); // only the boolean turns it on
-	assert.deepEqual(triageOf({ enabled: true, model: "typesafe/jev-latest" }), { spec: "typesafe/jev-latest", confidence: 0.6 });
+	assert.deepEqual(triageOf({ enabled: true, model: "typesafe/jev-latest" }), { spec: "typesafe/jev-latest", confidence: 0.75 });
 	assert.deepEqual(triageOf({ enabled: true, model: "oss/openjev", endpoint: "https://gw.example/typesafe/v1/systemone", confidence: 0.8 }), { spec: "oss/openjev", confidence: 0.8 });
 	assert.match(triageOf({ enabled: true, model: "oss/openjev" }), /not among pi's classifier models; set autoReview.triage.endpoint/);
 	assert.match(triageOf({ enabled: true, model: "oss/openjev", endpoint: "gw.example/systemone" }), /must be a full https URL/);
 	assert.match(triageOf({ enabled: true, model: "oss/openjev", endpoint: ["https://gw.example"] }), /must be a full https URL/);
 	// The provider's credentials go with it: plain HTTP only to this machine.
 	assert.match(triageOf({ enabled: true, model: "oss/openjev", endpoint: "http://gw.example/systemone" }), /must be a full https URL/);
-	assert.deepEqual(triageOf({ enabled: true, model: "oss/openjev", endpoint: "http://localhost:8080/systemone" }), { spec: "oss/openjev", confidence: 0.6 });
+	assert.deepEqual(triageOf({ enabled: true, model: "oss/openjev", endpoint: "http://localhost:8080/systemone" }), { spec: "oss/openjev", confidence: 0.75 });
 	// The questions are System One's: a llama.cpp classifier would render their options as "[object Object]".
 	assert.match(triageOf({ enabled: true, model: "llama/qwen" }), /uses the llama-cpp-classify API; triage needs a System One classifier/);
 	assert.match(triageOf({ enabled: true, model: "jev-latest" }), /must be "provider\/model-id"/);
 	assert.match(triageOf({ enabled: true, model: "typesafe/jev-latest", confidence: 0 }), /confidence must be/);
+	// At 0.6 the triage model cleared a call that should ask; a 0.6 set for the old rule is refused, not read loosely.
+	assert.match(triageOf({ enabled: true, model: "typesafe/jev-latest", confidence: 0.6 }), /confidence must be a number from 0.7 to 1/);
+	assert.match(triageOf({ enabled: true, model: "typesafe/jev-latest", confidence: 1.1 }), /confidence must be/);
 	assert.match(triageOf({ enabled: true, model: "typesafe/jev-latest", confidence: "0.5" }), /confidence must be/);
 });
 
@@ -268,9 +288,12 @@ test("a routine call the triage model clears runs without the reviewer; anything
 	const clear = await triaged(async () => answers({ read: 0.9, others: 0.1 }));
 	assert.deepEqual([clear.verdict.outcome, clear.verdict.risk, clear.seen], ["allow", "low", ["triage"]]);
 	assert.match(clear.verdict.reason, /Routine \(typesafe\/jev-latest: read\)/);
+	// The reason names the likeliest routine kind, not the answer's choice, which can be a risky kind it outweighs.
+	const split = await triaged(async () => ({ ...answers({ edit: 0.2, read: 0.2, connected: 0.2, destroy: 0.2, others: 0.2 }), kind: { choice: "destroy", probabilities: { edit: 0.2, read: 0.2, connected: 0.2, destroy: 0.2, others: 0.2 } } }));
+	assert.match(split.verdict.reason, /Routine \(typesafe\/jev-latest: read\)/);
 	const risky = await triaged(async () => answers({ destroy: 0.9, read: 0.1 }));
 	assert.deepEqual([risky.seen, risky.verdict.warning], [["triage", "review:high"], undefined]);
-	const strict = await triaged(async () => answers({ read: 0.7, others: 0.3 }), { confidence: 0.8 });
+	const strict = await triaged(async () => answers({ read: 0.78, others: 0.22 }), { confidence: 0.8 }); // clears at the default 0.75
 	assert.deepEqual(strict.seen, ["triage", "review:high"]);
 	const broken = await triaged(async () => {
 		throw new Error("429");
