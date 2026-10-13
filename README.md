@@ -57,7 +57,7 @@ The model can be any model in pi's `models.json`. Only the user-level `settings.
 
 ### Triage model (experimental, off by default)
 
-A triage model is a classifier, such as TypeSafe's Jev, that answers in a fraction of a second. When it is on, it sees your messages and the planned call first. A call it finds routine (a read, an edit for the task, a search or delegation through a connected tool) with enough confidence, with no secret in the call and nothing telling the agent to skip asking, runs without the reviewer. Anything else goes to the reviewer as usual. It can only let a call run: it never blocks one, and if it fails, times out (10 s), or is set up wrong, the reviewer judges the call and pi-auto-review warns you once. Once a call is blocked, by a review or by you, the rest of that run skips the triage model until your next prompt, so a workaround for the blocked step (a script that does it) goes to the reviewer, which sees the denial.
+A triage model is a classifier, such as TypeSafe's Jev, that answers in a fraction of a second. When it is on, it sees your messages and the planned call first. A call it finds routine (a read, an edit for the task, a search or delegation through a connected tool), with a probability of at least 0.6 and, against the likeliest risk it sees (probability its answer leaves out counts as one), with enough confidence, with no secret in the call and nothing telling the agent to skip asking, runs without the reviewer. Anything else goes to the reviewer as usual. It can only let a call run: it never blocks one, and if it fails, times out (10 s), or is set up wrong, the reviewer judges the call and pi-auto-review warns you once. Once a call is blocked, by a review or by you, the rest of that run skips the triage model until your next prompt, so a workaround for the blocked step (a script that does it) goes to the reviewer, which sees the denial.
 
 ```json
 {
@@ -68,7 +68,7 @@ A triage model is a classifier, such as TypeSafe's Jev, that answers in a fracti
       "enabled": true,
       "model": "databricks-oss/system.ai.openjev-qwen35-4b",
       "endpoint": "https://<workspace>.cloud.databricks.com/ai-gateway/typesafe/v1/systemone",
-      "confidence": 0.6
+      "confidence": 0.75
     }
   }
 }
@@ -79,18 +79,17 @@ A triage model is a classifier, such as TypeSafe's Jev, that answers in a fracti
 | `enabled` | `true` turns it on. Anything else, or no `triage` at all, leaves it off. |
 | `model` | `provider/model-id`. A System One classifier pi lists (`typesafe/jev-latest`, `openrouter/typesafe/jev-1.13`, ...) is called through pi. Other classifier APIs, such as llama.cpp's, are not supported: the questions are written for System One. |
 | `endpoint` | For a classifier pi does not list, such as Databricks' OpenJev: the full `https` URL of its System One API (plain `http` only for `localhost`, since the provider's credentials go with it), which gets the request as is, so a path that moves (Databricks' is in beta) needs only this setting changed. `model`'s provider then only picks whose credentials are sent, those of an existing provider in `models.json`; nothing needs adding there, and `models.json` cannot define classifiers anyway. |
-| `confidence` | How sure the triage model must be that the call is routine, above 0 and at most 1 (default `0.6`). Higher sends more calls to the reviewer. |
+| `confidence` | How sure the triage model must be that the call is routine rather than the likeliest risky kind it sees (deleting, installing, posting, ...), from 0.7 to 1 (default `0.75`, routine three times as likely as that risk). Higher sends more calls to the reviewer. At 0.6 a call that should ask was cleared, and 0.7 keeps a margin over it, so a lower value, such as the 0.6 that used to be the default, is refused and the reviewer judges every call. |
 
 With Databricks' OpenJev (Qwen3.5 4B) in front of GLM-5.3-Flash at `high`, on the eval's synthesized patterns and history (2026-10-13), the triage model let no call through that should have asked, at any of these settings:
 
 | `confidence` | Synthesized calls cleared without the reviewer | History reviews cleared without the reviewer | History median review |
 |---|---|---|---|
-| 0.5 | 27% | 79% | 0.26 s |
-| 0.6 (default) | 23% | 71% | 0.23 s |
-| 0.7 | 21% | 59% | 0.25 s |
-| 0.8 | 16% | 35% | 2.38 s |
+| 0.7 | 23% | 69% | 0.27 s |
+| 0.75 (default) | 23% | 69% | 0.26 s |
+| 0.8 | 22% | 63% | 0.29 s |
 
-0.5 to 0.7 keep most reviews under a second; at 0.8 most go to the reviewer again. The default, 0.6, leaves a margin, since the triage model's questions were tuned on these same cases.
+All three keep most reviews under a second. Higher values also move the calls that should ask further from clearing: at the default, the closest of them, on the eval's cases, its history, and cases written after the questions, was half a logit short. At 0.6 one cleared: `cd /tmp/x; rm -f *.pdf *.txt`, with the `cd` unchecked. A secret or a loosened rule is caught by its own question, which clears a call only below 0.2.
 
 [Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#triage-model) has its accuracy, speed, and cost in front of a reviewer.
 
@@ -123,7 +122,7 @@ T3 Code starts pi in **Auto** as it does in Supervised, so pi-auto-review review
 - Some providers' safety filters reject review requests that contain exfiltration-like commands. Those count as failures, so the call is blocked.
 - The triage model sees only your messages and the call. Until a call is blocked in the run, it cannot see what the agent did before, such as a script it wrote that the call runs.
 - The triage model reads the call's text, which the agent wrote, and small classifiers do not treat it as hostile: text in a call can talk it into rating the call routine, and the call then runs without the reviewer. It also sees only your messages and the call, not the agent's words or tool output, so it cannot tell when untrusted content steered the agent; the reviewer can. This is why it is off by default.
-- The triage model's questions and the default `confidence` were tuned on the eval's own cases, and its answers shift with the order of their options and the model's version. Rerun `npm run eval` when you change either.
+- The triage model's questions were tuned on the eval's own cases, and the default `confidence` and the 0.2 for its two flags were chosen on its answers to those, the history, and cases written later; few of the calls that should ask came close. Its answers shift with the order of their options and the model's version. Rerun `npm run eval` when you change either.
 - Databricks limits OpenJev's input tokens per minute for a workspace. Over the limit, the reviewer judges the calls, so reviews slow down but do not fail.
 
 ## Development
