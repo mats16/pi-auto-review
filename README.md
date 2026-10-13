@@ -6,7 +6,7 @@ AI auto-review for [pi](https://pi.dev) tool calls, after Codex's auto-review ("
 
 | Tool call | What happens |
 |---|---|
-| Calls on pi-auto-review's own files: `edit` / `write` under its folder, or any other call except `read`, `grep`, `find`, `ls` that names the folder | You are asked, without review (with no UI, it is blocked) |
+| Calls on pi-auto-review's own files: `edit` / `write` under its folder, or any other call except `read`, `grep`, `find`, `ls` that names the folder | You are asked, without review (with no UI, it is blocked). The prompt names the folder and, unless the call is an `edit` or `write`, says `read`, `grep`, `find`, and `ls` read it without asking, so declining a call that only reads sends the agent to them |
 | `read`, `grep`, `find`, `ls`, and tools annotated `readOnlyHint` | Runs |
 | `edit` / `write` to an ordinary file inside the working directory | Runs |
 | `edit` / `write` outside the working directory, or to a dot path (`.git`, `.env`, `.pi`, `.github`, ...) | Reviewed |
