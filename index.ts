@@ -25,7 +25,8 @@
  * is blocked, the rest of that run goes to the reviewer alone. It is off by default.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
  * the call, the verdict, who decided it, and the triage model's answers and the reviewer's time and tokens. Past 5 MB it
- * moves to pi-auto-review.jsonl.1, replacing the one before. Off by default.
+ * moves to pi-auto-review.jsonl.1, replacing the one before; if it cannot be moved, reviews go unlogged. A line over
+ * 16,000 characters keeps only the verdict. Off by default.
  */
 
 import { appendFileSync, readFileSync, renameSync, statSync } from "node:fs";
@@ -68,6 +69,9 @@ const DENIAL_WINDOW = 50;
 const MAX_LISTED_DENIALS = 10;
 // As pi does for mcp.log: past this, the review log moves to .1, replacing the one before.
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
+// One text field of a log line (the call, the reason, an error), and the whole line, whatever else it holds.
+const MAX_LOG_FIELD_CHARS = 500;
+const MAX_LOG_LINE_CHARS = 16_000;
 /** The verdict's shape, which OpenAI's Responses API enforces, so the reviewer cannot answer anything else. */
 const VERDICT_FORMAT = {
 	type: "json_schema",
@@ -582,7 +586,7 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 	// The triage model can only let a routine call run; anything else, or its failure, goes on to the reviewer.
 	// ponytail: trusts the classifier's "routine" on a call the agent wrote; keep it off where injection is a concern.
 	let warning = triage !== undefined && "error" in triage ? `pi-auto-review's triage model is off: ${triage.error}` : undefined;
-	if (triage !== undefined && "error" in triage) record.triage = { error: triage.error };
+	if (triage !== undefined && "error" in triage) record.triage = { error: clip(triage.error, MAX_LOG_FIELD_CHARS) };
 	else if (!useTriage && own.triage?.enabled === true) record.triage = "skipped after a block";
 	if (triage !== undefined && "classify" in triage) {
 		const timeout = AbortSignal.timeout(TRIAGE_TIMEOUT_MS);
@@ -603,7 +607,7 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 			if (ctx.signal?.aborted) return done(unreviewed("Review failed: aborted"));
 			const message = error instanceof Error ? error.message : String(error);
 			warning = `pi-auto-review's triage model failed, so the reviewer judges calls it could not: ${message}`;
-			record.triage = { model: triage.spec, ms: Date.now() - sent, error: message };
+			record.triage = { model: triage.spec, ms: Date.now() - sent, error: clip(message, MAX_LOG_FIELD_CHARS) };
 		}
 	}
 	record.by = "reviewer";
@@ -617,18 +621,28 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
  * cleared, how long the reviewer took, and what it cost. A failed write is dropped: it must not change the verdict.
  */
 // ponytail: the call goes in as the agent wrote it (clipped), secrets included; delete the files to reset.
-function log(ctx: ExtensionContext, toolName: string, input: unknown, verdict: Verdict, record: object, started: number) {
+function log(ctx: ExtensionContext, toolName: string, input: unknown, verdict: Verdict, record: { by?: string }, started: number) {
 	try {
 		const { outcome, risk, authorization, reason } = verdict;
-		const line = { time: new Date(started).toISOString(), session: ctx.sessionManager.getSessionId?.(), cwd: ctx.cwd, tool: toolName, call: clip(summary(toolName, input), 500), outcome, risk, authorization, reason, ms: Date.now() - started, ...record };
+		// The reason can hold a gateway's whole error page: clipped, the line keeps its start.
+		const head = { time: new Date(started).toISOString(), session: ctx.sessionManager.getSessionId?.(), cwd: ctx.cwd, tool: toolName, outcome, risk, authorization };
+		let line = JSON.stringify({ ...head, call: clip(summary(toolName, input), MAX_LOG_FIELD_CHARS), reason: clip(reason, MAX_LOG_FIELD_CHARS), ms: Date.now() - started, ...record });
+		// Anything else, such as the answers a custom triage endpoint sent, is as long as it came: past the limit, the
+		// line keeps only the verdict.
+		if (line.length > MAX_LOG_LINE_CHARS) line = JSON.stringify({ ...head, by: record.by, oversized: line.length });
 		const file = join(agentDir(), "pi-auto-review.jsonl");
-		// Several pi processes can share the file, so each line is one append, and a failed rotation still appends.
+		const size = () => statSync(file, { throwIfNoEntry: false })?.size ?? 0;
+		// Several pi processes can share the file, so each line is one append, and the size is checked again after the
+		// rename: another process may have rotated it first, and a file that cannot be moved must not keep growing.
 		// ponytail: two processes rotating at once can move a fresh file over the full .1; a lock fixes it if that matters.
-		try {
-			if ((statSync(file, { throwIfNoEntry: false })?.size ?? 0) > MAX_LOG_BYTES) renameSync(file, `${file}.1`);
-		} catch {}
+		if (size() > MAX_LOG_BYTES) {
+			try {
+				renameSync(file, `${file}.1`);
+			} catch {}
+			if (size() > MAX_LOG_BYTES) return;
+		}
 		// Only the user can read it: it holds the calls, secrets included. The .1 keeps the mode through the rename.
-		appendFileSync(file, `${JSON.stringify(line)}\n`, { mode: 0o600 });
+		appendFileSync(file, `${line}\n`, { mode: 0o600 });
 	} catch {}
 }
 
