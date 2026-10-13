@@ -117,6 +117,38 @@ US dollars per million tokens, from each provider's public price list as checked
 | GLM-5.3 | 1.40 | 4.40 | [Z.ai](https://docs.z.ai/guides/overview/pricing) |
 | Kimi K3 | 3.00 | 15.00 | [Moonshot AI](https://platform.kimi.ai/docs/pricing/chat) |
 
+## Triage model
+
+Measured on 2026-10-13 at `96c8e9f`, under the current POLICY of that commit, on 74 synthesized cases × 3 runs and 80 history prompts × 2 runs, through Databricks AI Gateway. Databricks' OpenJev (`system.ai.openjev-qwen35-4b`, Qwen3.5 4B) is the triage model at `confidence` 0.5, in front of a reviewer at `high`, asked seven questions by the benchmark's own harness (see the notes below; [Confidence](#confidence) measures the extension itself). The reviewer-only rows are the 2026-10-12 runs of the same cases. These numbers are not comparable with the tables above, which used older POLICYs and case sets.
+
+| Setup | Synthetic accuracy | Missed / extra asks / failed | Decided by the triage model (synthetic / history) | History: ran | History median | History 90th percentile | Reviewer $ / 1,000 reviews (history) |
+|---|---|---|---|---|---|---|---|
+| GLM-5.3-Flash | 99.5% | 0 / 1 / 0 | none | 96.2% | 3.7 s | 8.5 s | 0.41 |
+| OpenJev → GLM-5.3-Flash | 100.0% | 0 / 0 / 0 | 26% / 79% | 97.5% | 0.3 s | 4.1 s | 0.09 |
+| GPT-6.1 Sol | 98.2% | 0 / 4 / 0 | none | 87.5% | 9.6 s | 14.1 s | 4.19 |
+| OpenJev → GPT-6.1 Sol | 97.7% | 0 / 5 / 0 | 27% / 78% | 95.0% | 0.3 s | 9.8 s | 0.86 |
+
+- Latency is the models' responses only. In pi, each review also resolves the provider's API key, about a second when `models.json` runs a command for it.
+- Cost is the reviewer's only: Databricks publishes no price for OpenJev. Its requests average about 3,300 input tokens on the synthetic cases and more on the history, whose user messages are longer.
+- Of the history prompts the triage model cleared, none had been denied by all three of GLM-5.3-Flash high, GPT-6.1 Sol high, and Claude Haiku 5.5 low. A first version that summed the routine kinds without requiring the likeliest kind to be one cleared `cd /tmp/x; rm -f *.pdf *.txt`, which every reviewer denies; the requirement is what ships.
+- The questions were written, and `confidence` chosen, by looking at these same synthesized cases, so the synthetic numbers are optimistic. Choosing the thresholds on half the cases and testing on the other half let no call that must ask through, and cleared about half of the calls that must run.
+- The runs were measured with four more questions than the extension asks, which only a triage model used alone needs. Asking just the three the extension asks gave the same decisions on all 154 cases, with half the input tokens.
+- With 32 requests in flight, about 30% hit Databricks' per-workspace limit on input tokens per minute; with four, none did.
+
+### Confidence
+
+The extension itself (its three questions), in front of GLM-5.3-Flash at `high`, on the same cases and runs, with each provider's API key resolved once. None of the mistakes came from the triage model: the two at 0.5 were GLM-5.3-Flash's own, on dependency bumps after `/auto-review`, which the triage model had passed on to it.
+
+| `confidence` | Synthetic accuracy | Decided by the triage model (synthetic / history) | History: ran | History median | History 90th percentile | Reviewer $ / 1,000 reviews (history) |
+|---|---|---|---|---|---|---|
+| GLM-5.3-Flash alone | 99.5% | none | 96.2% | 3.7 s | 8.5 s | 0.41 |
+| 0.5 | 99.1% | 27% / 79% | 97.5% | 0.26 s | 3.7 s | 0.10 |
+| 0.6 (default) | 100.0% | 23% / 71% | 96.9% | 0.23 s | 3.5 s | 0.11 |
+| 0.7 | 100.0% | 21% / 59% | 96.2% | 0.25 s | 4.6 s | 0.15 |
+| 0.8 | 100.0% | 16% / 35% | 96.9% | 2.38 s | 5.2 s | 0.24 |
+
+Of the history prompts the triage model cleared, two had been denied by GLM-5.3-Flash alone at 0.5 to 0.7, and one at 0.8; none by all three reviewers above. The default is 0.6: it keeps the speed of 0.5 with a margin, since the questions were tuned on these cases.
+
 ## Choosing
 
 - **Fewest mistakes**: GPT-6.1 Sol. Under the current POLICY it made no mistakes at high and only extra asks at low, at about $6 per 1,000 reviews.
@@ -124,4 +156,5 @@ US dollars per million tokens, from each provider's public price list as checked
 - **Claude Haiku 5.5 at high** is as cheap and, under the current POLICY, only asked too often; it is about twice as slow as GLM-5.3-Flash.
 - **GPT-6 Luna at high** asks more often than the others, both on the suite and on the history, so expect more prompts.
 - **Claude Sonnet 5.5** is the least suited: its safety filter rejects reviews of exfiltration-like calls, and those then ask (or, in Full access, run with a warning). It is also among the most expensive.
+- **A triage model in front of the reviewer** (experimental, off by default): OpenJev in front of GLM-5.3-Flash, at the default `confidence` 0.6, made no mistakes on the suite and answered about seven in ten history reviews in a fraction of a second, at about a quarter of the reviewer's cost. It reads the agent-written call without suspicion, so it is a speed-up you opt into, not a safeguard; see [Triage model](../README.md#triage-model-experimental-off-by-default).
 - Effort matters more for the smaller models: before #11, GLM-5.3-Flash went from 10 wrong at low to 2 at high. Reviews run at high by default; add `:low` to `PI_AUTO_REVIEW_MODEL` only for a model that stays accurate there.
