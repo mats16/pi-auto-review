@@ -23,9 +23,12 @@
  * likeliest risk (probability its answer leaves out counts as one) with enough confidence, runs without the reviewer, and
  * anything else, or its failure, goes to the reviewer. It can only let a call run, never block one, and after any call
  * is blocked, the rest of that run goes to the reviewer alone. It is off by default.
+ * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
+ * the call, the verdict, who decided it, and the triage model's answers and the reviewer's time and tokens. Past 5 MB it
+ * moves to pi-auto-review.jsonl.1, replacing the one before. Off by default.
  */
 
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,6 +66,8 @@ const MAX_CONSECUTIVE_DENIALS = 3;
 const MAX_RECENT_DENIALS = 10;
 const DENIAL_WINDOW = 50;
 const MAX_LISTED_DENIALS = 10;
+// As pi does for mcp.log: past this, the review log moves to .1, replacing the one before.
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
 /** The verdict's shape, which OpenAI's Responses API enforces, so the reviewer cannot answer anything else. */
 const VERDICT_FORMAT = {
 	type: "json_schema",
@@ -405,14 +410,17 @@ function unreviewed(reason: string): Verdict {
  * autoReview in pi's user settings.json. Only the user's file counts: pi merges a project's .pi/settings.json into its
  * settings, and a project must not pick its own reviewer. Throws if the file exists but cannot be read.
  */
-type Settings = { model?: unknown; effort?: unknown; triage?: Record<string, unknown> };
+type Settings = { model?: unknown; effort?: unknown; triage?: Record<string, unknown>; log?: unknown };
+
+// ponytail: mirrors pi's getAgentDir (imports stay type-only); recheck when pi moves its agent directory.
+function agentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=$|[/\\])/, homedir()) || join(homedir(), ".pi", "agent");
+}
 
 function settings(): Settings {
-	// ponytail: mirrors pi's getAgentDir (imports stay type-only); recheck when pi moves its agent directory.
-	const dir = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=$|[/\\])/, homedir()) || join(homedir(), ".pi", "agent");
 	let content;
 	try {
-		content = readFileSync(join(dir, "settings.json"), "utf8");
+		content = readFileSync(join(agentDir(), "settings.json"), "utf8");
 	} catch (error) {
 		if ((error as { code?: string }).code === "ENOENT") return {};
 		throw error;
@@ -550,42 +558,82 @@ function likeliestRoutine(answers: Answers): string {
 
 /** Reviews one call. `triage: false` leaves it to the reviewer even when a triage model is on. */
 export async function review(ctx: ExtensionContext, toolName: string, input: unknown, { triage: useTriage = true } = {}): Promise<Verdict> {
+	let own: Settings;
 	let picked;
 	let triage;
 	try {
 		// One read of settings.json, so the reviewer and the triage model come from the same version of it.
-		const own = settings();
+		own = settings();
 		picked = reviewer(ctx, own);
 		triage = useTriage ? triageModel(ctx, own) : undefined;
 	} catch (error) {
 		return unreviewed(`Cannot read the reviewer from pi's settings.json: ${error instanceof Error ? error.message : error}`);
 	}
 	const { model, reasoning, spec } = picked;
-	if (model === undefined) return unreviewed(`Reviewer model not found (${spec ?? "none set, and no session model"}).`);
+	// What autoReview.log records of this review, filled in as it goes.
+	const record: { by?: string; triage?: object | string; reviewer?: Record<string, unknown> } = {};
+	const started = Date.now();
+	const done = (verdict: Verdict) => {
+		if (own.log === true) log(ctx, toolName, input, verdict, record, started);
+		return verdict;
+	};
+	if (model === undefined) return done(unreviewed(`Reviewer model not found (${spec ?? "none set, and no session model"}).`));
 	const lines = transcript(ctx.sessionManager.getBranch());
 	// The triage model can only let a routine call run; anything else, or its failure, goes on to the reviewer.
 	// ponytail: trusts the classifier's "routine" on a call the agent wrote; keep it off where injection is a concern.
 	let warning = triage !== undefined && "error" in triage ? `pi-auto-review's triage model is off: ${triage.error}` : undefined;
+	if (triage !== undefined && "error" in triage) record.triage = { error: triage.error };
+	else if (!useTriage && own.triage?.enabled === true) record.triage = "skipped after a block";
 	if (triage !== undefined && "classify" in triage) {
 		const timeout = AbortSignal.timeout(TRIAGE_TIMEOUT_MS);
+		const sent = Date.now();
 		try {
 			const answers = await triage.classify(
 				{ state: triageState(lines, ctx.cwd, toolName, input), questions: TRIAGE_QUESTIONS },
 				ctx.signal ? AbortSignal.any([timeout, ctx.signal]) : timeout,
 			);
-			if (routine(answers, triage.confidence)) return { outcome: "allow", risk: "low", authorization: "unknown", reason: `Routine (${triage.spec}: ${likeliestRoutine(answers)}).` };
+			const cleared = routine(answers, triage.confidence);
+			record.triage = { model: triage.spec, ms: Date.now() - sent, routine: cleared, answers };
+			if (cleared) {
+				record.by = "triage";
+				return done({ outcome: "allow", risk: "low", authorization: "unknown", reason: `Routine (${triage.spec}: ${likeliestRoutine(answers)}).` });
+			}
 		} catch (error) {
 			// The session's own abort is not a triage failure: it would show a false warning and use up the only one.
-			if (ctx.signal?.aborted) return unreviewed("Review failed: aborted");
-			warning = `pi-auto-review's triage model failed, so the reviewer judges calls it could not: ${error instanceof Error ? error.message : String(error)}`;
+			if (ctx.signal?.aborted) return done(unreviewed("Review failed: aborted"));
+			const message = error instanceof Error ? error.message : String(error);
+			warning = `pi-auto-review's triage model failed, so the reviewer judges calls it could not: ${message}`;
+			record.triage = { model: triage.spec, ms: Date.now() - sent, error: message };
 		}
 	}
-	const verdict = await reviewWith(ctx, model, reasoning, lines, toolName, input);
-	return warning === undefined ? verdict : { ...verdict, warning };
+	record.by = "reviewer";
+	record.reviewer = { model: spec ?? `${model.provider}/${model.id}`, effort: reasoning };
+	const verdict = await reviewWith(ctx, model, reasoning, lines, toolName, input, record.reviewer);
+	return done(warning === undefined ? verdict : { ...verdict, warning });
 }
 
-/** One review by the reviewer model. */
-async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionContext["model"]>, reasoning: string, lines: string[], toolName: string, input: unknown): Promise<Verdict> {
+/**
+ * Appends one review to pi-auto-review.jsonl in pi's agent directory, for analysis: how many calls the triage model
+ * cleared, how long the reviewer took, and what it cost. A failed write is dropped: it must not change the verdict.
+ */
+// ponytail: the call goes in as the agent wrote it (clipped), secrets included; delete the files to reset.
+function log(ctx: ExtensionContext, toolName: string, input: unknown, verdict: Verdict, record: object, started: number) {
+	try {
+		const { outcome, risk, authorization, reason } = verdict;
+		const line = { time: new Date(started).toISOString(), session: ctx.sessionManager.getSessionId?.(), cwd: ctx.cwd, tool: toolName, call: clip(summary(toolName, input), 500), outcome, risk, authorization, reason, ms: Date.now() - started, ...record };
+		const file = join(agentDir(), "pi-auto-review.jsonl");
+		// Several pi processes can share the file, so each line is one append, and a failed rotation still appends.
+		// ponytail: two processes rotating at once can move a fresh file over the full .1; a lock fixes it if that matters.
+		try {
+			if ((statSync(file, { throwIfNoEntry: false })?.size ?? 0) > MAX_LOG_BYTES) renameSync(file, `${file}.1`);
+		} catch {}
+		// Only the user can read it: it holds the calls, secrets included. The .1 keeps the mode through the rename.
+		appendFileSync(file, `${JSON.stringify(line)}\n`, { mode: 0o600 });
+	} catch {}
+}
+
+/** One review by the reviewer model. `record` gets its time and token usage, for autoReview.log. */
+async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionContext["model"]>, reasoning: string, lines: string[], toolName: string, input: unknown, record: Record<string, unknown>): Promise<Verdict> {
 	const prompt = [
 		`Working directory: ${ctx.cwd}`,
 		`This reviewer's own files: ${SELF_DIR}`,
@@ -599,6 +647,7 @@ async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionCon
 	].join("\n");
 	const timeout = AbortSignal.timeout(TIMEOUT_MS);
 	const signal = ctx.signal ? AbortSignal.any([timeout, ctx.signal]) : timeout;
+	const sent = Date.now();
 	try {
 		// Pin the effort: left unset, each provider picks its own, and some GPT models then do no reasoning at all.
 		const response = await ctx.modelRegistry
@@ -613,6 +662,7 @@ async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionCon
 				},
 			)
 			.result();
+		record.usage = response.usage;
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
 			return unreviewed(`Review failed: ${response.errorMessage ?? response.stopReason}`);
 		}
@@ -620,6 +670,8 @@ async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionCon
 		return parseVerdict(text) ?? unreviewed(`Unreadable review: ${clip(text, 200)}`);
 	} catch (error) {
 		return unreviewed(`Review failed: ${error instanceof Error ? error.message : String(error)}`);
+	} finally {
+		record.ms = Date.now() - sent;
 	}
 }
 
