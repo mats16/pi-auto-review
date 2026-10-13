@@ -11,7 +11,8 @@
  * retry is still reviewed, with that approval as trusted evidence. Three denials in a row, or ten in the last fifty
  * reviews within one run, stop that run.
  * Calls on this extension's own files, and calls too large for the reviewer to see whole, skip the reviewer and go to
- * a human, or are blocked when no UI exists.
+ * a human, or are blocked when no UI exists. The prompt for its own files names the folder and, unless the call is an
+ * edit or write, points to read, grep, find, and ls, which read it without asking.
  * In T3 Code it reviews only in Supervised and Auto-accept edits, in place of the bridge's own prompts. In Full access
  * everything runs unreviewed, as in Codex, and any other mode keeps the bridge's prompts.
  * The reviewer is PI_AUTO_REVIEW_MODEL, else autoReview.model in pi's user settings.json, else the session's model, run
@@ -662,16 +663,23 @@ export default function autoReview(pi: ExtensionAPI) {
 			blockedThisRun = true;
 			return { block: true, reason };
 		};
-		/** A call the reviewer must not decide goes to the user, shown whole, or is blocked without a UI. */
-		const askUser = async (why: string) => {
+		/**
+		 * A call the reviewer must not decide goes to the user, shown whole, or is blocked without a UI.
+		 * A hint names the route that stays open, after the warning against retrying, so it is not read as one.
+		 */
+		const askUser = async (why: string, hint = "") => {
 			// T3 Code reads the tool name from this exact title to label the approval.
-			if (ctx.hasUI && (await ctx.ui.confirm(`Allow ${event.toolName}?`, `${why}\n\n${plannedCall(event.toolName, event.input)}`))) return;
+			if (ctx.hasUI && (await ctx.ui.confirm(`Allow ${event.toolName}?`, `${why}${hint}\n\n${plannedCall(event.toolName, event.input)}`))) return;
 			const next = ctx.hasUI ? "The user declined it." : "Only the user can approve it, from an interactive session.";
-			return block(`${why} ${next} Do not retry it in another form to get around this.`);
+			return block(`${why} ${next} Do not retry it in another form to get around this.${hint}`);
 		};
 		if (touches(SELF_DIR, event.toolName, event.input, ctx.cwd)) {
 			// Calls on this extension's own files skip the reviewer, so the agent cannot talk it into them.
-			return askUser("pi-auto-review: calls on its own files are never left to the reviewer.");
+			// Name the folder, and for a call that may only read, the tools that read it without asking, so a decline sends
+			// the agent there. An edit or write cannot be done by reading.
+			const own = SELF_DIR.replace(homedir(), "~");
+			const hint = FILE_TOOLS.has(event.toolName) ? "" : " To only read these files, use read, grep, find, or ls instead: they run without asking.";
+			return askUser(`pi-auto-review: calls on its own files (${own}) are never left to the reviewer.`, hint);
 		}
 		const readOnlyHint = pi.getAllTools().find((tool) => tool.name === event.toolName)?.annotations?.readOnlyHint;
 		if (!needsReview(event.toolName, event.input, ctx.cwd, readOnlyHint)) return;

@@ -440,6 +440,10 @@ test("calls on the extension's own files skip the reviewer and go to a human, sh
 	const command = `cat ${import.meta.dirname}/index.ts`;
 	const asked = await runCall("approval-required", { outcome: "allow" }, command);
 	assert.deepEqual([asked.blocked, asked.seen], [true, ["confirm"]]);
+	// The user sees which folder matched, and declining sends the agent to the tools that read it without asking.
+	assert.ok(confirmed!.at(-1)!.includes(`own files (${import.meta.dirname.replace(homedir(), "~")})`));
+	// The hint comes after the warning against retrying, so it reads as the route that stays open.
+	assert.match(asked.reason, /Do not retry it in another form.* use read, grep, find, or ls instead/);
 	const handlers = load(undefined);
 	const seen: string[] = [];
 	assert.equal(await handlers.tool_call({ toolName: "bash", input: { command } }, fakeCtx("", seen, true, true)), undefined);
@@ -447,6 +451,12 @@ test("calls on the extension's own files skip the reviewer and go to a human, sh
 	const headless = await runCall(undefined, { outcome: "allow" }, command, false);
 	assert.deepEqual([headless.blocked, headless.seen], [true, []]);
 	assert.match(headless.reason, /interactive session/);
+	// An edit or write cannot be done by reading, so it gets no hint to read instead.
+	const editSeen: string[] = [];
+	const edit = await load(undefined).tool_call({ toolName: "edit", input: { path: `${import.meta.dirname}/index.ts` } }, fakeCtx("", editSeen, false));
+	assert.deepEqual([edit?.block, editSeen], [true, []]);
+	assert.match(String(edit?.reason), /own files \(.*interactive session/);
+	assert.doesNotMatch(String(edit?.reason), /use read/);
 });
 
 test("a call too large for the reviewer to see whole goes to the user, never to the reviewer", async () => {
