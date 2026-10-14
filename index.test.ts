@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import autoReview, { approvalDetails, approvalMessage, triageModel, triageState, needsReview, parseVerdict, review, reviewer, routine, touches, transcript } from "./index.ts";
+import autoReview, { approvalDetails, approvalMessage, issue, issueUrl, triageModel, triageState, needsReview, parseVerdict, review, reviewer, routine, touches, transcript } from "./index.ts";
 
 const cwd = "/work/project";
 // The reviewer reads pi's user settings.json; keep the user's own out of every test.
@@ -312,6 +312,25 @@ test("a routine call the triage model clears runs without the reviewer; anything
 	assert.match(off.verdict.warning!, /triage model is off/);
 });
 
+test("each verdict carries the reviewer's model and effort and the triage settings it ran with, for /auto-review-report", async () => {
+	const clear = await triaged(async () => answers({ read: 0.9, others: 0.1 }), {}, undefined, { effort: "low" });
+	assert.deepEqual(clear.verdict.setup, { reviewer: "undefined/undefined", effort: "low", triage: "typesafe/jev-latest, confidence 0.75", by: "triage" });
+	// The endpoint is left out, since a workspace URL can name the organization.
+	const custom = await triaged(async () => answers({ destroy: 1 }), { model: "oss/openjev", endpoint: "https://acme.example/so", confidence: 0.8 });
+	assert.deepEqual([custom.verdict.setup?.triage, custom.verdict.setup?.by], ["oss/openjev, confidence 0.8, custom endpoint", "reviewer"]);
+	assert.match((await triaged(async () => answers({ read: 1 }), { model: "jev-latest" })).verdict.setup!.triage, /^jev-latest, confidence 0.75 \(unusable: autoReview.triage.model must be/);
+	// Written by hand, it could garble the report's list: kept to one clipped line.
+	assert.match((await triaged(async () => answers({ read: 1 }), { model: `a\n- b${"x".repeat(300)}` })).verdict.setup!.triage, /^a - bx+…\[\d+ more chars\] \(unusable/);
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { triage: { enabled: true, model: "typesafe/jev-latest" } } }));
+	try {
+		const skipped = await review(fakeCtx('{"outcome":"allow"}', []) as any, "bash", { command: "ls" }, { triage: false });
+		assert.equal(skipped.setup?.triage, "typesafe/jev-latest, confidence 0.75 (skipped after a block)");
+	} finally {
+		rmSync(join(agentDir, "settings.json"));
+	}
+	assert.equal((await review(fakeCtx('{"outcome":"allow"}', []) as any, "bash", { command: "ls" })).setup?.triage, "off");
+});
+
 test("autoReview.log appends each review to pi-auto-review.jsonl: who decided, the triage answers, the reviewer's time and tokens", async () => {
 	const file = join(agentDir, "pi-auto-review.jsonl");
 	try {
@@ -415,6 +434,8 @@ function load(mode: string | undefined): Record<string, any> {
 		getAllTools: () => [],
 		registerCommand: (name: string, command: any) => (handlers[`/${name}`] = command.handler),
 		sendMessage: (message: any) => (handlers.sent ??= []).push(message),
+		// Never settles, like xdg-open waiting on the browser it started: /auto-review-report must not wait on it.
+		exec: (command: string, args: string[]) => ((handlers.opened ??= []).push([command, ...args]), new Promise(() => {})),
 	} as any);
 	return handlers;
 }
@@ -439,6 +460,7 @@ function fakeCtx(text: string, seen: string[], hasUI = true, approve = false) {
 			confirm: async (_title: string, message: string) => (seen.push("confirm"), (confirmed ??= []).push(message), approve),
 			notify: (message: string) => (seen.push("notify"), (notified ??= []).push(message)),
 			select: async (_title: string, options: string[]) => (seen.push(`select:${options.join("|")}`), options[0]),
+			input: async () => (seen.push("input"), "It should have asked: this pushes to main."),
 		},
 		abort: () => seen.push("abort"),
 	};
@@ -651,4 +673,46 @@ test("Full access runs everything unreviewed, as in Codex, and other T3 modes ke
 		assert.deepEqual(load(mode), {});
 		assert.equal(process.env.T3_PI_RUNTIME_MODE, mode); // the bridge keeps the mode
 	}
+});
+
+test("/auto-review-report drafts a public issue for a recent verdict, shown whole before it opens in the browser", async () => {
+	const handlers = load(undefined);
+	const seen: string[] = [];
+	await handlers["/auto-review-report"]("", fakeCtx("", seen));
+	assert.deepEqual(seen, ["notify"]); // nothing reviewed yet
+	await handlers.tool_call({ toolName: "bash", input: { command: "git push origin main" } }, fakeCtx(JSON.stringify({ risk_level: "medium", user_authorization: "low", outcome: "allow", rationale: "a branch push" }), seen));
+	await handlers.tool_call({ toolName: "bash", input: { command: "x" } }, fakeCtx("unreadable", seen)); // a failed review is not a verdict
+	await handlers["/auto-review-report"]("", fakeCtx("", seen)); // the user declines the draft
+	assert.ok(seen.includes("select:1. allowed: git push origin main — a branch push"));
+	assert.deepEqual([seen.slice(-2), handlers.opened], [["input", "confirm"], undefined]);
+	const draft = confirmed!.at(-1)!;
+	assert.match(draft, /public[\s\S]*Misjudged: allowed git push origin main[\s\S]*by the reviewer[\s\S]*### Settings\n- model: \S+\n- effort: high\n- triage: off\n[\s\S]*should have asked: this pushes to main[\s\S]*"command": "git push origin main"/);
+	await handlers["/auto-review-report"]("", fakeCtx("", seen, true, true));
+	const url = new URL(handlers.opened[0].at(-1));
+	assert.equal(url.origin + url.pathname, "https://github.com/mats16/pi-auto-review/issues/new");
+	assert.ok(draft.endsWith(url.searchParams.get("body")!)); // what opens is what the user saw
+	assert.match(notified!.at(-1)!, /nothing is sent until you submit it: https:\/\/github\.com/);
+	// A review while the list is open does not shift the pick onto another verdict.
+	const racing: any = fakeCtx("", seen);
+	let n = 0;
+	racing.ui.select = async (_title: string, options: string[]) => {
+		await handlers.tool_call({ toolName: "bash", input: { command: `rm -rf build${++n}` } }, fakeCtx(JSON.stringify({ risk_level: "high", outcome: "deny", rationale: "r" }), seen));
+		return options[0];
+	};
+	await handlers["/auto-review-report"]("", racing);
+	assert.match(confirmed!.at(-1)!, /git push origin main/);
+	await handlers["/auto-review"]("", racing); // the same for approvals
+	assert.match(confirmed!.at(-1)!, /"command": "rm -rf build1"/); // the only denial when its list opened, not build2
+});
+
+test("issueUrl clips the draft from the end, the call, to stay under GitHub's URL limit", () => {
+	const { title, body } = issue("bash", { command: `echo ${"日本語".repeat(3_000)}` }, { outcome: "deny", risk: "high", authorization: "low", reason: "長い" }, "許可すべき");
+	const url = issueUrl(title, body);
+	assert.ok(url.length <= 8_000);
+	const sent = new URL(url).searchParams.get("body")!;
+	assert.match(sent, /^### What pi-auto-review decided[\s\S]*許可すべき[\s\S]*### The call[\s\S]*more chars\]$/);
+	assert.equal(new URL(issueUrl("t", "short")).searchParams.get("body"), "short");
+	// A huge pasted note is cut in one estimate, not encoded once per step, and still fills most of the URL.
+	const huge = issueUrl("t", "注".repeat(200_000));
+	assert.ok(huge.length <= 8_000 && huge.length > 7_000);
 });
