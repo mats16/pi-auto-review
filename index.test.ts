@@ -318,6 +318,15 @@ test("each verdict carries the reviewer's model and effort and the triage settin
 	// The endpoint is left out, since a workspace URL can name the organization.
 	const custom = await triaged(async () => answers({ destroy: 1 }), { model: "oss/openjev", endpoint: "https://acme.example/so", confidence: 0.8 });
 	assert.deepEqual([custom.verdict.setup?.triage, custom.verdict.setup?.by], ["oss/openjev, confidence 0.8, custom endpoint", "reviewer"]);
+	// Nor does the error for an endpoint it refuses, which quotes it.
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { triage: { enabled: true, model: "oss/openjev", endpoint: "http://private-workspace.example/serving" } } }));
+	let refused;
+	try {
+		refused = await review(fakeCtx('{"outcome":"allow"}', []) as any, "bash", { command: "ls" }); // not among pi's classifiers, so the endpoint is checked
+	} finally {
+		rmSync(join(agentDir, "settings.json"));
+	}
+	assert.match(refused.setup!.triage, /custom endpoint \(unusable: autoReview.triage.endpoint must be a full https URL \(http only for localhost\), not <endpoint>\.\)$/);
 	assert.match((await triaged(async () => answers({ read: 1 }), { model: "jev-latest" })).verdict.setup!.triage, /^jev-latest, confidence 0.75 \(unusable: autoReview.triage.model must be/);
 	// Written by hand, it could garble the report's list: kept to one clipped line.
 	assert.match((await triaged(async () => answers({ read: 1 }), { model: `a\n- b${"x".repeat(300)}` })).verdict.setup!.triage, /^a - bx+…\[\d+ more chars\] \(unusable/);
@@ -687,7 +696,15 @@ test("/auto-review-report drafts a public issue for a recent verdict, shown whol
 	assert.deepEqual([seen.slice(-2), handlers.opened], [["input", "confirm"], undefined]);
 	const draft = confirmed!.at(-1)!;
 	assert.match(draft, /public[\s\S]*Misjudged: allowed git push origin main[\s\S]*by the reviewer[\s\S]*### Settings\n- model: \S+\n- effort: high\n- triage: off\n[\s\S]*should have asked: this pushes to main[\s\S]*"command": "git push origin main"/);
-	await handlers["/auto-review-report"]("", fakeCtx("", seen, true, true));
+	// The opener runs only with a display on Linux; give it one, so the test does not depend on the machine.
+	const display = process.env.DISPLAY;
+	process.env.DISPLAY = ":0";
+	try {
+		await handlers["/auto-review-report"]("", fakeCtx("", seen, true, true));
+	} finally {
+		if (display === undefined) delete process.env.DISPLAY;
+		else process.env.DISPLAY = display;
+	}
 	const url = new URL(handlers.opened[0].at(-1));
 	assert.equal(url.origin + url.pathname, "https://github.com/mats16/pi-auto-review/issues/new");
 	assert.ok(draft.endsWith(url.searchParams.get("body")!)); // what opens is what the user saw

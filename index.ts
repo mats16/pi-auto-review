@@ -596,7 +596,8 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		const { model: triageSpec, confidence, endpoint } = own.triage;
 		// Clipped and on one line, as written by hand it could be anything and would garble the report's list.
 		triageSetup = clip(`${String(triageSpec)}, confidence ${confidence ?? TRIAGE_CONFIDENCE}`.replace(/\s+/g, " "), 200) + (endpoint ? ", custom endpoint" : "");
-		if (triage !== undefined && "error" in triage) triageSetup += ` (unusable: ${clip(triage.error, 200)})`;
+		// The error for a bad endpoint quotes it, so it is masked there too.
+		if (triage !== undefined && "error" in triage) triageSetup += ` (unusable: ${clip(endpoint === undefined ? triage.error : triage.error.replaceAll(JSON.stringify(endpoint), "<endpoint>"), 200)})`;
 		else if (!useTriage) triageSetup += " (skipped after a block)";
 	}
 	const setup = { reviewer: spec ?? (model === undefined ? "none" : `${model.provider}/${model.id}`), effort: reasoning, triage: triageSetup };
