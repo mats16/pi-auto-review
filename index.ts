@@ -12,7 +12,8 @@
  * retry is still reviewed, with that approval as trusted evidence. Three denials in a row, or ten in the last fifty
  * reviews within one run, stop that run.
  * Calls on this extension's own files, and calls too large for the reviewer to see whole, skip the reviewer and go to
- * a human, or are blocked when no UI exists. Edits and writes are judged by where their links lead. A compaction note,
+ * a human, or are blocked when no UI exists. Edits and writes are judged by the name written and where its links lead,
+ * and one whose place cannot be told (a link that leads nowhere, a hard link) goes to a human too. A compaction note,
  * or a task for a pi subagent outside Full access, that names its folder is reviewed instead: the subagent's own calls on
  * it still go to a human. The prompt for its own files names the folder and, unless the call is an
  * edit or write, points to read, grep, find, and ls, which read it without asking.
@@ -25,7 +26,8 @@
  * messages and the call first: a call it finds routine with a probability of at least 0.6, and routine rather than its
  * likeliest risk (probability its answer leaves out counts as one) with enough confidence, runs without the reviewer, and
  * anything else, or its failure, goes to the reviewer. It can only let a call run, never block one, and after any call
- * is blocked, the rest of that run goes to the reviewer alone. It is off by default.
+ * is blocked, the rest of that run goes to the reviewer alone, as does any call over 32,000 characters. It is off by
+ * default.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
  * the call, the verdict, who decided it, and the triage model's answers and the reviewer's time and tokens. Past 5 MB it
  * moves to pi-auto-review.jsonl.1, replacing the one before; if it cannot be moved, reviews go unlogged. A line over
@@ -65,6 +67,9 @@ const TIMEOUT_MS = 90_000;
 const REASONING = "high";
 const LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 const TRIAGE_TIMEOUT_MS = 10_000;
+// A call over this goes to the reviewer alone, as every call over it went to the user before MAX_CALL_CHARS grew: a small
+// classifier, or an endpoint that clips its input to fit, could see only the routine start of a long call.
+const TRIAGE_MAX_CALL_CHARS = 32_000;
 // Measured on OpenJev's answers to the eval's cases, its history, and cases written after the questions
 // (docs/benchmarks.md): 0.75, routine three times as likely as the likeliest risk, clears nearly as many history
 // reviews as the old rule did and leaves the closest call that should ask 0.5 logit short of clearing. At 0.6 one cleared.
@@ -342,9 +347,10 @@ function resolveToolPath(cwd: string, path: string): string {
 }
 
 /**
- * path with every symlink in the part that exists resolved, so a link in the working directory or /tmp (which other
- * users can write to) cannot point a write elsewhere. Undefined when that cannot be told: a link that leads nowhere, a
- * path that cannot be read, or a file with other names (hard links), whose other places are unknown.
+ * path with every symlink in the part that exists resolved, and its names as the file system stores them (a
+ * case-insensitive one matches /X to /x), so a link in the working directory or /tmp (which other users can write to)
+ * cannot point a write elsewhere. Undefined when that cannot be told: a link that leads nowhere, or a path that cannot
+ * be read.
  */
 // ponytail: checked before the write, so a link another process makes in between is followed; pi's tools would have to
 // open the file with O_NOFOLLOW to close that.
@@ -356,15 +362,23 @@ function realPath(path: string): string | undefined {
 			rest.unshift(basename(head));
 			head = dirname(head);
 		}
-		const real = join(realpathSync(head), ...rest);
-		if (rest.length === 0) {
-			const file = statSync(real);
-			if (file.isFile() && file.nlink > 1) return undefined;
-		}
-		return real;
+		return join(realpathSync.native(head), ...rest);
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * The places an edit or write to path lands on: the name as written, and where its links lead. Undefined when that
+ * cannot be told: a link that leads nowhere, a path that cannot be read, or a file with hard links, whose other names
+ * are unknown.
+ */
+function writePlaces(cwd: string, path: string): string[] | undefined {
+	const written = resolveToolPath(cwd, path);
+	const real = realPath(written);
+	if (real === undefined) return undefined;
+	const file = statSync(real, { throwIfNoEntry: false });
+	return file?.isFile() && file.nlink > 1 ? undefined : [written, real];
 }
 
 /**
@@ -386,17 +400,23 @@ export function needsReview(toolName: string, input: Record<string, unknown>, cw
 	if (READ_ONLY_TOOLS.has(toolName) || SCRIPT_TOOLS.has(toolName) || readOnlyHint === true) return false;
 	if (FILE_TOOLS.has(toolName) && typeof input.path === "string") {
 		// resolve() has already applied any "..", so /tmp/../x is not under /tmp.
-		const path = realPath(resolveToolPath(cwd, input.path));
-		if (path === undefined) return true;
-		const dir = [cwd, ...TMP_DIRS].map(realPath).find((d) => d !== undefined && inside(d, path));
-		// Dot paths (.git, .env, .pi, .github, ...) hold config, hooks, and secrets, so they still get reviewed.
-		return dir === undefined || relative(dir, path).split(sep).some((part) => part.startsWith("."));
+		const places = writePlaces(cwd, input.path);
+		if (places === undefined) return true;
+		// Each place is checked against the folders as named and as stored, the name as written against the first.
+		const dirs = [cwd, ...TMP_DIRS].flatMap((d) => [d, realPath(d) ?? d]);
+		// Dot paths (.git, .env, .pi, .github, ...) hold config, hooks, and secrets, so they still get reviewed, whether
+		// the agent named one or a link leads to one.
+		return places.some((place) => {
+			const dir = dirs.find((d) => inside(d, place));
+			return dir === undefined || relative(dir, place).split(sep).some((part) => part.startsWith("."));
+		});
 	}
 	return true;
 }
 
 /**
- * Whether a call works on dir: an edit or write under it (or through a link into it), or any other call that names it
+ * Whether a call works on dir: an edit or write under it (as named, through a link, or to a place that cannot be told),
+ * or any other call that names it
  * and is not a built-in read, text for an agent whose calls are checked, or a codemode script (whose tool calls are
  * checked on their own). Calls on this extension's own files go to a human, so the agent cannot talk the reviewer into
  * them.
@@ -404,10 +424,9 @@ export function needsReview(toolName: string, input: Record<string, unknown>, cw
 export function touches(dir: string, toolName: string, input: Record<string, unknown>, cwd: string): boolean {
 	if (READ_ONLY_TOOLS.has(toolName) || SCRIPT_TOOLS.has(toolName) || textForCheckedAgent(toolName, input)) return false;
 	if (FILE_TOOLS.has(toolName) && typeof input.path === "string") {
-		const path = resolveToolPath(cwd, input.path);
-		const real = realPath(path);
-		// A path whose real place cannot be told is reviewed (needsReview), not taken for this folder.
-		return inside(dir, path) || (real !== undefined && inside(realPath(dir) ?? dir, real));
+		const places = writePlaces(cwd, input.path);
+		// A write whose place cannot be told could land here.
+		return places === undefined || places.some((place) => inside(dir, place) || inside(realPath(dir) ?? dir, place));
 	}
 	// ponytail: lexical, a relative path or a variable hides dir; the reviewer still sees those calls.
 	const text = JSON.stringify(input);
@@ -656,16 +675,19 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 	let own: Settings;
 	let picked;
 	let triage;
+	let skipped: string | undefined;
 	try {
 		// One read of settings.json, so the reviewer and the triage model come from the same version of it.
 		own = settings();
 		picked = reviewer(ctx, own);
-		triage = useTriage ? triageModel(ctx, own) : undefined;
+		if (!useTriage) skipped = "skipped after a block";
+		else if (plannedCall(toolName, input).length > TRIAGE_MAX_CALL_CHARS) skipped = "skipped for a large call";
+		triage = skipped === undefined ? triageModel(ctx, own) : undefined;
 	} catch (error) {
 		return unreviewed(`Cannot read the reviewer from pi's settings.json: ${error instanceof Error ? error.message : error}`);
 	}
 	const { model, reasoning, spec } = picked;
-	// The triage settings as written, so a report shows them even when they were unusable or skipped after a block.
+	// The triage settings as written, so a report shows them even when they were unusable or skipped.
 	// The endpoint stays out: a workspace URL can name the organization.
 	let triageSetup = "off";
 	if (own.triage?.enabled === true) {
@@ -674,7 +696,7 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		triageSetup = clip(`${String(triageSpec)}, confidence ${confidence ?? TRIAGE_CONFIDENCE}`.replace(/\s+/g, " "), 200) + (endpoint ? ", custom endpoint" : "");
 		// The error for a bad endpoint quotes it, so it is masked there too.
 		if (triage !== undefined && "error" in triage) triageSetup += ` (unusable: ${clip(endpoint === undefined ? triage.error : triage.error.replaceAll(JSON.stringify(endpoint), "<endpoint>"), 200)})`;
-		else if (!useTriage) triageSetup += " (skipped after a block)";
+		else if (skipped !== undefined) triageSetup += ` (${skipped})`;
 	}
 	const setup = { reviewer: spec ?? (model === undefined ? "none" : `${model.provider}/${model.id}`), effort: reasoning, triage: triageSetup };
 	// What autoReview.log records of this review, filled in as it goes.
@@ -690,7 +712,7 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 	// ponytail: trusts the classifier's "routine" on a call the agent wrote; keep it off where injection is a concern.
 	let warning = triage !== undefined && "error" in triage ? `pi-auto-review's triage model is off: ${triage.error}` : undefined;
 	if (triage !== undefined && "error" in triage) record.triage = { error: clip(triage.error, MAX_LOG_FIELD_CHARS) };
-	else if (!useTriage && own.triage?.enabled === true) record.triage = "skipped after a block";
+	else if (skipped !== undefined && own.triage?.enabled === true) record.triage = skipped;
 	if (triage !== undefined && "classify" in triage) {
 		const timeout = AbortSignal.timeout(TRIAGE_TIMEOUT_MS);
 		const sent = Date.now();
