@@ -5,9 +5,11 @@ pi-auto-review is a [pi](https://pi.dev) extension modeled on Codex's auto-revie
 ## Layout
 
 - `index.ts`: the whole extension. pi loads it as TypeScript; there is no build step.
-- `index.test.ts`: tests for the exported decision functions (`needsReview`, `touches`, `parseVerdict`, `transcript`, `reviewer`, `triageModel`, `triageState`, `routine`) and the `tool_call` handler.
+- `index.test.ts`: tests for the exported decision functions (`needsReview`, `touches`, `parseVerdict`, `transcript`, `reviewer`, `triageModel`, `triageState`, `routine`, `issue`, `issueUrl`) and the `tool_call` handler.
 - `review.eval.ts`: replays the prompts the user approved in T3 Code's history and lists those that still ask, and checks patterns synthesized from it (calls that must run, and the risky variants that must still be denied), against a live reviewer. Local only.
 - `.github/workflows/pullfrog.yml`: generated; edit only where it says so.
+- `.github/workflows/publish.yml`: publishes to npm when a GitHub release is published; the tag must match `version` in `package.json`.
+- `.github/ISSUE_TEMPLATE/misjudgment.md`: the issue `/auto-review-report` drafts; keep their headings the same.
 
 ## Commands
 

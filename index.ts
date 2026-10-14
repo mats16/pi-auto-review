@@ -27,6 +27,9 @@
  * the call, the verdict, who decided it, and the triage model's answers and the reviewer's time and tokens. Past 5 MB it
  * moves to pi-auto-review.jsonl.1, replacing the one before; if it cannot be moved, reviews go unlogged. A line over
  * 16,000 characters keeps only the verdict. Off by default.
+ * /auto-review-report drafts a GitHub issue for one of the last ten verdicts that looks wrong, with the reviewer's model
+ * and effort and the triage settings it ran with: the user adds what should have happened, sees the whole draft, and it
+ * opens in the browser, where nothing is sent until they submit it.
  */
 
 import { appendFileSync, readFileSync, renameSync, statSync } from "node:fs";
@@ -37,6 +40,13 @@ import type { Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
+const VERSION = (() => {
+	try {
+		return String(JSON.parse(readFileSync(join(SELF_DIR, "package.json"), "utf8")).version);
+	} catch {
+		return "unknown";
+	}
+})();
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const FILE_TOOLS = new Set(["edit", "write"]);
 const TIMEOUT_MS = 90_000;
@@ -72,6 +82,9 @@ const MAX_LOG_BYTES = 5 * 1024 * 1024;
 // One text field of a log line (the call, the reason, an error), and the whole line, whatever else it holds.
 const MAX_LOG_FIELD_CHARS = 500;
 const MAX_LOG_LINE_CHARS = 16_000;
+const ISSUES = "https://github.com/mats16/pi-auto-review/issues";
+// GitHub refuses longer new-issue URLs, so the draft's tail, the call, is clipped to fit.
+const MAX_ISSUE_URL = 8_000;
 /** The verdict's shape, which OpenAI's Responses API enforces, so the reviewer cannot answer anything else. */
 const VERDICT_FORMAT = {
 	type: "json_schema",
@@ -107,6 +120,8 @@ export interface Verdict {
 	reason: string;
 	/** A problem with the triage model, which left the call to the reviewer. */
 	warning?: string;
+	/** The settings the review ran with, and who decided it, for /auto-review-report. */
+	setup?: { reviewer: string; effort: string; triage: string; by?: string };
 }
 
 const POLICY = `You are judging one planned tool call by an AI coding agent (pi) on the user's machine.
@@ -574,12 +589,24 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		return unreviewed(`Cannot read the reviewer from pi's settings.json: ${error instanceof Error ? error.message : error}`);
 	}
 	const { model, reasoning, spec } = picked;
+	// The triage settings as written, so a report shows them even when they were unusable or skipped after a block.
+	// The endpoint stays out: a workspace URL can name the organization.
+	let triageSetup = "off";
+	if (own.triage?.enabled === true) {
+		const { model: triageSpec, confidence, endpoint } = own.triage;
+		// Clipped and on one line, as written by hand it could be anything and would garble the report's list.
+		triageSetup = clip(`${String(triageSpec)}, confidence ${confidence ?? TRIAGE_CONFIDENCE}`.replace(/\s+/g, " "), 200) + (endpoint ? ", custom endpoint" : "");
+		// The error for a bad endpoint quotes it, so it is masked there too.
+		if (triage !== undefined && "error" in triage) triageSetup += ` (unusable: ${clip(endpoint === undefined ? triage.error : triage.error.replaceAll(JSON.stringify(endpoint), "<endpoint>"), 200)})`;
+		else if (!useTriage) triageSetup += " (skipped after a block)";
+	}
+	const setup = { reviewer: spec ?? (model === undefined ? "none" : `${model.provider}/${model.id}`), effort: reasoning, triage: triageSetup };
 	// What autoReview.log records of this review, filled in as it goes.
 	const record: { by?: string; triage?: object | string; reviewer?: Record<string, unknown> } = {};
 	const started = Date.now();
 	const done = (verdict: Verdict) => {
 		if (own.log === true) log(ctx, toolName, input, verdict, record, started);
-		return verdict;
+		return { ...verdict, setup: { ...setup, by: record.by } };
 	};
 	if (model === undefined) return done(unreviewed(`Reviewer model not found (${spec ?? "none set, and no session model"}).`));
 	const lines = transcript(ctx.sessionManager.getBranch());
@@ -713,8 +740,10 @@ export default function autoReview(pi: ExtensionAPI) {
 	let blockedThisRun = false;
 	let recent: boolean[] = [];
 	// Newest first, for /auto-review. Critical ones are left out: approval cannot unlock them.
-	// ponytail: in memory, so a reload or new session clears it; rebuild it from the branch if that matters.
+	// ponytail: in memory, as is reviews below, so a reload or new session clears both; rebuild them from the branch if that matters.
 	let denials: { toolName: string; input: unknown; reason: string }[] = [];
+	// Newest first, for /auto-review-report: every verdict, allowed or denied, but not a review that failed.
+	let reviews: { toolName: string; input: unknown; verdict: Verdict }[] = [];
 	// ponytail: warns about the triage model once per load, so a later, different problem with it goes unshown.
 	let warned = false;
 	pi.on("agent_start", () => {
@@ -762,6 +791,7 @@ export default function autoReview(pi: ExtensionAPI) {
 		if (verdict.risk === "unknown") {
 			return block(`pi-auto-review could not review ${event.toolName}, so it did not run: ${verdict.reason} ${REVIEW_FAILURE}`);
 		}
+		reviews = [{ toolName: event.toolName, input: event.input, verdict }, ...reviews].slice(0, MAX_LISTED_DENIALS);
 		const denied = verdict.outcome === "deny";
 		consecutive = denied ? consecutive + 1 : 0;
 		recent = [...recent, denied].slice(-DENIAL_WINDOW);
@@ -786,9 +816,11 @@ export default function autoReview(pi: ExtensionAPI) {
 		description: "Approve one retry of a recent pi-auto-review denial",
 		handler: async (_args, ctx) => {
 			if (denials.length === 0) return ctx.ui.notify("No recent pi-auto-review denials to approve.", "info");
-			const options = denials.map((d, i) => `${i + 1}. ${clip(summary(d.toolName, d.input), 120)} — ${clip(d.reason, 200)}`);
+			// A review during the dialog replaces the list, so the pick is read from the one it showed.
+			const listed = denials;
+			const options = listed.map((d, i) => `${i + 1}. ${clip(summary(d.toolName, d.input), 120)} — ${clip(d.reason, 200)}`);
 			const picked = await ctx.ui.select("Select a denied action to approve", options);
-			const denial = picked === undefined ? undefined : denials[options.indexOf(picked)];
+			const denial = picked === undefined ? undefined : listed[options.indexOf(picked)];
 			if (denial === undefined) return;
 			// The list clips each call, so the user confirms the exact approval the reviewer will trust.
 			const approval = approvalMessage(denial.toolName, denial.input);
@@ -800,6 +832,69 @@ export default function autoReview(pi: ExtensionAPI) {
 			ctx.ui.notify("Approval recorded for one retry of the selected denial. The retry still goes through pi-auto-review.", "info");
 		},
 	});
+
+	pi.registerCommand("auto-review-report", {
+		description: "Report a recent pi-auto-review verdict that looks wrong as a GitHub issue",
+		handler: async (_args, ctx) => {
+			if (reviews.length === 0) return ctx.ui.notify("No recent pi-auto-review verdicts to report.", "info");
+			const listed = reviews; // as in /auto-review
+			const options = listed.map((r, i) => `${i + 1}. ${r.verdict.outcome === "allow" ? "allowed" : "denied"}: ${clip(summary(r.toolName, r.input), 120)} — ${clip(r.verdict.reason, 200)}`);
+			const picked = await ctx.ui.select("Select the verdict that looks wrong", options);
+			const report = picked === undefined ? undefined : listed[options.indexOf(picked)];
+			if (report === undefined) return;
+			const expected = await ctx.ui.input("What should pi-auto-review have done, and why?", "It should have asked: the push goes to main.");
+			if (expected === undefined) return;
+			const { title, body } = issue(report.toolName, report.input, report.verdict, expected);
+			// The issue is public and the call can hold secrets or private paths: the user sees the whole draft first.
+			if (!(await ctx.ui.confirm("Open this draft issue in your browser?", `It will be public once you submit it. Remove anything private there first.\n\n${title}\n\n${body}`))) return;
+			const url = issueUrl(title, body);
+			ctx.ui.notify(`Draft issue for pi-auto-review; nothing is sent until you submit it: ${url}`, "info");
+			// Not awaited: xdg-open can wait until the browser it started closes. Without a display it would start a console
+			// browser on pi's terminal, so there the URL above is all.
+			// ponytail: the OS's own opener, and a failure to open goes unshown; the URL above still works.
+			const [command, ...args] = process.platform === "darwin" ? ["open"] : process.platform === "win32" ? ["rundll32", "url.dll,FileProtocolHandler"] : ["xdg-open"];
+			if (command === "xdg-open" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return;
+			pi.exec(command, [...args, url]).catch(() => {});
+		},
+	});
+}
+
+/** The draft issue for a verdict the user reports, the call last, so clipping it to fit a URL keeps the rest. */
+export function issue(toolName: string, input: unknown, verdict: Verdict, expected: string) {
+	const outcome = verdict.outcome === "allow" ? "allowed" : "denied";
+	const title = `Misjudged: ${outcome} ${clip(summary(toolName, input), 80)}`;
+	const body = [
+		"### What pi-auto-review decided",
+		`${outcome} (risk: ${verdict.risk}, authorization: ${verdict.authorization}, by the ${verdict.setup?.by === "triage" ? "triage model" : "reviewer"})`,
+		"",
+		`> ${verdict.reason.replace(/\n/g, "\n> ")}`,
+		"",
+		"### Settings",
+		`- model: ${verdict.setup?.reviewer ?? "unknown"}`,
+		`- effort: ${verdict.setup?.effort ?? "unknown"}`,
+		`- triage: ${verdict.setup?.triage ?? "unknown"}`,
+		"",
+		"### What it should have done",
+		expected.trim() || "(not given)",
+		"",
+		"### Version",
+		`pi-auto-review ${VERSION}, ${process.platform}`,
+		"",
+		"### The call",
+		"```json",
+		plannedCall(toolName, input),
+		"```",
+	].join("\n");
+	return { title, body };
+}
+
+/** The new-issue URL with the draft filled in, its body clipped from the end to stay under GitHub's limit. */
+export function issueUrl(title: string, body: string): string {
+	const url = (text: string) => `${ISSUES}/new?${new URLSearchParams({ title, labels: "misjudgment", body: text })}`;
+	// Start from the share of the body that fits, so a long body is not encoded once per step.
+	let max = Math.min(body.length, Math.floor((body.length * MAX_ISSUE_URL) / url(body).length));
+	while (max > 0 && url(clip(body, max)).length > MAX_ISSUE_URL) max -= 100;
+	return url(clip(body, Math.max(max, 0)));
 }
 
 /** What /auto-review records for the reviewer: the approved call, as data. */

@@ -5,6 +5,8 @@
   "type": "module",
   "license": "MIT",
   "author": "mats16",
+  "homepage": "https://github.com/mats16/pi-auto-review#readme",
+  "bugs": "https://github.com/mats16/pi-auto-review/issues",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mats16/pi-auto-review.git"
@@ -23,6 +25,9 @@
   ],
   "publishConfig": {
     "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   },
   "pi": {
     "extensions": [

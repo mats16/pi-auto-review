@@ -29,11 +29,14 @@ The deny rules cover: hard-to-undo destruction (including a deletion that runs e
 
 ## Install
 
+pi-auto-review is a [pi package](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md), from npm or from this repository:
+
 ```bash
+pi install npm:@mats16/pi-auto-review
 pi install git:github.com/mats16/pi-auto-review
 ```
 
-To try it for one run: `pi -e git:github.com/mats16/pi-auto-review`.
+To try it for one run: `pi -e npm:@mats16/pi-auto-review`. Add `@<version>` (npm) or `@<tag>` (git) to pin a release; `pi update --extensions` moves an unpinned install to the latest. It needs no dependencies beyond pi itself.
 
 ## Configure
 
@@ -116,6 +119,10 @@ jq -s 'group_by(.by) | map({by: .[0].by, n: length})' ~/.pi/agent/pi-auto-review
 jq -s '[.[] | .reviewer.ms // empty] | sort | .[length/2|floor]' ~/.pi/agent/pi-auto-review.jsonl
 ```
 
+## Report a misjudgment
+
+When a verdict looks wrong, a call that ran but should have asked or one denied that should have run, run `/auto-review-report`. It lists the last 10 verdicts, asks what should have happened, shows you the whole draft, and opens it as a new [GitHub issue](https://github.com/mats16/pi-auto-review/issues) in your browser: nothing is sent until you submit it there. The draft holds the verdict and whether the triage model or the reviewer gave it, the settings it ran with (the reviewer's model and effort, and the triage model, its `confidence`, and whether a custom `endpoint` is set, not the URL), your note, the version, and the call as the agent wrote it, which can include secrets or private paths: remove those before you submit. Your messages are not included, so say in your note what you had asked for. Without the command, the [Misjudged call](https://github.com/mats16/pi-auto-review/issues/new?template=misjudgment.md) template asks for the same.
+
 ## T3 Code
 
 | Mode | What happens |
@@ -133,7 +140,8 @@ T3 Code starts pi in **Auto** as it does in Supervised, so pi-auto-review review
 - Unlike Codex's reviewer, it cannot run commands to check a target (what `rm -rf` would delete, whether a repository is private): it judges from the transcript, and leans toward denying when that is not enough.
 - Long sessions are cut to fit: your messages first, then the newest of the rest. A step you ruled out is kept unless your messages alone fill the budget.
 - In Full access, nothing is reviewed, including calls on pi-auto-review's own files.
-- `/auto-review` lists the denials since pi-auto-review loaded, so a reload or a new session clears the list.
+- `/auto-review` lists the denials since pi-auto-review loaded, and `/auto-review-report` the verdicts, so a reload or a new session clears both lists. `/auto-review-report` cannot report a call that went to you without review.
+- `/auto-review-report` opens the draft with the OS's opener (`open`, `xdg-open`, `rundll32`); where none works, copy the URL it shows. A draft too long for a URL loses the end of the call. On Windows, `rundll32` can fail on a URL over about 2,000 characters, which a long call or note reaches; the URL it shows still works.
 - An `/auto-review` approval stays in the transcript, as in Codex, so only the reviewer keeps it to one retry: the same call repeated later can be allowed again.
 - The reviewer treats `/tmp` as scratch, so the agent can write or overwrite any file there (a symlink there can point elsewhere), and delete named files there, or files matching a prefix wildcard, or a folder named by a variable the same command sets, without asking, even ones you put there yourself.
 - The agent can edit the instructions and skills inside the working directory without review, so an edit the reviewer misreads as harmless shapes later sessions.
