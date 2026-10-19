@@ -11,12 +11,13 @@
  * unless it is critical. /auto-review approves one retry of a recent denial, as in Codex: the agent is told, and the
  * retry is still reviewed, with that approval as trusted evidence. Three denials in a row, or ten in the last fifty
  * reviews within one run, stop that run.
- * Calls on this extension's own files, and calls too large for the reviewer to see whole, skip the reviewer and go to
- * a human, or are blocked when no UI exists. Edits and writes are judged by the name written and where its links lead,
- * and one whose place cannot be told (a link that leads nowhere, a hard link) goes to a human too. A compaction note,
- * or a task for a pi subagent outside Full access, that names its folder is reviewed instead: the subagent's own calls on
- * it still go to a human. The prompt for its own files names the folder and, unless the call is an
- * edit or write, points to read, grep, find, and ls, which read it without asking.
+ * Calls on this extension's own files skip the reviewer and are blocked without asking. Edits and writes are judged by
+ * the name written and where its links lead, and one whose place cannot be told (a link that leads nowhere, a hard
+ * link) is blocked too. A compaction note, or a task for a pi subagent outside Full access, that names its folder is
+ * reviewed instead: the subagent's own calls on it are still blocked. The block names the folder and, unless the call
+ * is an edit or write, points to read, grep, find, and ls, which read it without asking. It does not check whether the
+ * call only reads: the agent, told this, picks the read tools if that is all it needs. Calls too large for the
+ * reviewer to see whole skip it and go to a human, or are blocked when no UI exists.
  * In T3 Code it reviews only in Supervised and Auto-accept edits, in place of the bridge's own prompts. In Full access
  * everything runs unreviewed, as in Codex, and any other mode keeps the bridge's prompts.
  * The reviewer is PI_AUTO_REVIEW_MODEL, else autoReview.model in pi's user settings.json, else the session's model, run
@@ -384,10 +385,10 @@ function writePlaces(cwd: string, path: string): string[] | undefined {
 /**
  * Whether a call only hands text to an agent whose own calls this extension still checks: a summary of this session,
  * or a task for a subagent that is pi, like this session (no provider named), outside Full access. Naming this
- * extension's folder there does not act on it, and the subagent's own calls on the folder still go to a human.
+ * extension's folder there does not act on it, and the subagent's own calls on the folder are still blocked.
  */
 // ponytail: compact_context by name (a user's extension adds it, not pi); one that does more than summarize still goes
-// to the reviewer, not to a human, when it names the folder.
+// to the reviewer, not blocked, when it names the folder.
 function textForCheckedAgent(toolName: string, input: Record<string, unknown>): boolean {
 	if (toolName === "compact_context") return true;
 	if (toolName !== "mcp__t3-code__delegate_task" || input.runtimeMode === "full-access") return false;
@@ -418,7 +419,7 @@ export function needsReview(toolName: string, input: Record<string, unknown>, cw
  * Whether a call works on dir: an edit or write under it (as named, through a link, or to a place that cannot be told),
  * or any other call that names it
  * and is not a built-in read, text for an agent whose calls are checked, or a codemode script (whose tool calls are
- * checked on their own). Calls on this extension's own files go to a human, so the agent cannot talk the reviewer into
+ * checked on their own). Calls on this extension's own files are blocked, so the agent cannot talk the reviewer into
  * them.
  */
 export function touches(dir: string, toolName: string, input: Record<string, unknown>, cwd: string): boolean {
@@ -856,29 +857,26 @@ export default function autoReview(pi: ExtensionAPI) {
 			blockedThisRun = true;
 			return { block: true, reason };
 		};
-		/**
-		 * A call the reviewer must not decide goes to the user, shown whole, or is blocked without a UI.
-		 * A hint names the route that stays open, after the warning against retrying, so it is not read as one.
-		 */
-		const askUser = async (why: string, hint = "") => {
-			// T3 Code reads the tool name from this exact title to label the approval.
-			if (ctx.hasUI && (await ctx.ui.confirm(`Allow ${event.toolName}?`, `${why}${hint}\n\n${plannedCall(event.toolName, event.input)}`))) return;
-			const next = ctx.hasUI ? "The user declined it." : "Only the user can approve it, from an interactive session.";
-			return block(`${why} ${next} Do not retry it in another form to get around this.${hint}`);
-		};
 		if (touches(SELF_DIR, event.toolName, event.input, ctx.cwd)) {
-			// Calls on this extension's own files skip the reviewer, so the agent cannot talk it into them.
-			// Name the folder, and for a call that may only read, the tools that read it without asking, so a decline sends
-			// the agent there. An edit or write cannot be done by reading.
+			// Calls on this extension's own files skip the reviewer, so the agent cannot talk it into them, and are blocked
+			// without asking, so an unattended run is not left waiting. The block names the folder and, unless the call is an
+			// edit or write, the tools that read it without asking: the agent, not this check, tells whether its call only reads.
 			const own = SELF_DIR.replace(homedir(), "~");
 			const hint = FILE_TOOLS.has(event.toolName) ? "" : " To only read these files, use read, grep, find, or ls instead: they run without asking.";
-			return askUser(`pi-auto-review: calls on its own files (${own}) are never left to the reviewer.`, hint);
+			return block(
+				`pi-auto-review: calls on its own files (${own}) are never left to the reviewer, so it did not run. Do not retry it in another form to get around this.${hint} To change these files, stop and tell the user: they can make the change themselves, or allow it outside pi-auto-review (Full access in T3 Code).`,
+			);
 		}
 		const readOnlyHint = pi.getAllTools().find((tool) => tool.name === event.toolName)?.annotations?.readOnlyHint;
 		if (!needsReview(event.toolName, event.input, ctx.cwd, readOnlyHint)) return;
 		if (plannedCall(event.toolName, event.input).length > MAX_CALL_CHARS) {
-			// The reviewer must see a call whole, or a risky tail runs unseen; as in Codex, one past its budget asks the user.
-			return askUser(`pi-auto-review: this call is too large to review (over ${MAX_CALL_CHARS} characters).`);
+			// The reviewer must see a call whole, or a risky tail runs unseen; as in Codex, one past its budget asks the user,
+			// shown whole, or is blocked without a UI.
+			const why = `pi-auto-review: this call is too large to review (over ${MAX_CALL_CHARS} characters).`;
+			// T3 Code reads the tool name from this exact title to label the approval.
+			if (ctx.hasUI && (await ctx.ui.confirm(`Allow ${event.toolName}?`, `${why}\n\n${plannedCall(event.toolName, event.input)}`))) return;
+			const next = ctx.hasUI ? "The user declined it." : "Only the user can approve it, from an interactive session.";
+			return block(`${why} ${next} Do not retry it in another form to get around this.`);
 		}
 
 		const verdict = await review(ctx, event.toolName, event.input, { triage: !blockedThisRun });
