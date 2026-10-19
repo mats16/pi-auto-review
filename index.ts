@@ -29,7 +29,8 @@
  * likeliest risk (probability its answer leaves out counts as one) with enough confidence, runs without the reviewer, and
  * anything else, or its failure, goes to the reviewer. It can only let a call run, never block one, and after any call
  * is blocked, the rest of that run goes to the reviewer alone, as does any call over 32,000 characters. It is off by
- * default.
+ * default. It is called at autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with
+ * models.json's credentials: the key itself, or "!" and a command that prints it, whose output is kept five minutes.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
  * the call, the verdict, who decided it, and the triage model's answers and the reviewer's time and tokens. Past 5 MB it
  * moves to pi-auto-review.jsonl.1, replacing the one before; if it cannot be moved, reviews go unlogged. A line over
@@ -39,10 +40,12 @@
  * opens in the browser, where nothing is sent until they submit it.
  */
 
+import { exec } from "node:child_process";
 import { appendFileSync, lstatSync, readFileSync, realpathSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import type { Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -563,7 +566,13 @@ function settings(): Settings {
 	}
 	// As pi reads it: an empty file is no settings, and a leading BOM is dropped.
 	if (content === "") return {};
-	return JSON.parse(content.replace(/^\uFEFF/, ""))?.autoReview ?? {};
+	try {
+		return JSON.parse(content.replace(/^\uFEFF/, ""))?.autoReview ?? {};
+	} catch (error) {
+		// V8 quotes the text around the mistake, which can be an API key: only where it is goes on to the agent.
+		const where = String((error as Error).message).match(/ at position \d+(?: \(line \d+ column \d+\))?/)?.[0] ?? "";
+		throw new Error(`it is not valid JSON${where}`);
+	}
 }
 
 /**
@@ -588,57 +597,90 @@ type Classify = (context: ClassifierContext, signal: AbortSignal) => Promise<Ans
 
 /**
  * The triage model from autoReview.triage, when "enabled" is true: a classifier that lets routine calls run without
- * the reviewer. It is found among pi's classifier models, else called at "endpoint", the full URL of a System One API,
- * with its provider's credentials. A setting that cannot be used is returned as an error, and the reviewer judges every
- * call.
+ * the reviewer. It is called at "endpoint", the full URL of a System One API, as "model", with "apiKey" as its bearer
+ * token. A setting that cannot be used is returned as an error, and the reviewer judges every call.
  */
-export function triageModel(ctx: ExtensionContext, own: Settings = settings()): { spec: string; confidence: number; classify: Classify } | { error: string } | undefined {
+export function triageModel(own: Settings = settings()): { spec: string; confidence: number; classify: Classify } | { error: string } | undefined {
 	const triage = own.triage;
 	if (triage?.enabled !== true) return undefined;
 	const spec = typeof triage.model === "string" ? triage.model : "";
-	const slash = spec.indexOf("/");
-	if (slash <= 0) return { error: `autoReview.triage.model must be "provider/model-id", not ${JSON.stringify(triage.model)}.` };
+	if (spec === "") return { error: `autoReview.triage.model must be the classifier's model ID, not ${JSON.stringify(triage.model)}.` };
 	const confidence = triage.confidence ?? TRIAGE_CONFIDENCE;
 	if (typeof confidence !== "number" || !(confidence >= TRIAGE_MIN_CONFIDENCE && confidence <= 1)) return { error: `autoReview.triage.confidence must be a number from ${TRIAGE_MIN_CONFIDENCE} to 1.` };
-	const [provider, id] = [spec.slice(0, slash), spec.slice(slash + 1)];
-	const listed = ctx.modelRegistry.findOfType?.("classifier", provider, id);
-	if (listed !== undefined) {
-		// The questions are System One's, with options described as objects; other classifier APIs (llama.cpp's) render
-		// each option as text and would see "[object Object]".
-		if (!listed.api.endsWith("-system-one")) return { error: `${spec} uses the ${listed.api} API; triage needs a System One classifier.` };
-		return {
-			spec,
-			confidence,
-			classify: async (context, signal) => {
-				const result = await ctx.modelRegistry.classify(listed, context as Parameters<ExtensionContext["modelRegistry"]["classify"]>[1], { signal });
-				if (result.stopReason !== "stop") throw new Error(result.errorMessage ?? result.stopReason);
-				return result.answers as Answers;
-			},
-		};
-	}
-	const endpoint = triage.endpoint;
-	if (endpoint === undefined || endpoint === "") return { error: `${spec} is not among pi's classifier models; set autoReview.triage.endpoint to the full URL of its System One API.` };
+	const { endpoint, apiKey: keySetting } = triage;
+	if (endpoint === undefined || endpoint === "") return { error: "autoReview.triage.endpoint must be set to the full URL of the classifier's System One API." };
 	// Whole, not a base: the path is the provider's (Databricks' is still in beta), so a moved one needs only the setting.
-	// The provider's credentials go with the request, so only over TLS, or plain HTTP to this machine.
+	// The API key goes with the request, so only over TLS, or plain HTTP to this machine.
 	const url = typeof endpoint === "string" ? URL.parse(endpoint) : null;
 	const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url?.hostname ?? "");
 	if (url === null || !(url.protocol === "https:" || (url.protocol === "http:" && loopback))) {
 		return { error: `autoReview.triage.endpoint must be a full https URL (http only for localhost), not ${JSON.stringify(endpoint)}.` };
 	}
-	return { spec, confidence, classify: (context, signal) => systemOne(ctx, provider, id, String(endpoint), context, signal) };
+	if (keySetting !== undefined && (typeof keySetting !== "string" || keySetting.replace(/^!/, "").trim() === "")) {
+		return { error: "autoReview.triage.apiKey must be the key, or ! and a command that prints it." };
+	}
+	return { spec, confidence, classify: (context, signal) => systemOne(spec, String(endpoint), keySetting, context, signal) };
 }
 
-/** One System One request, POSTed to the endpoint with the provider's credentials, in the body pi sends TypeSafe. */
-async function systemOne(ctx: ExtensionContext, provider: string, id: string, endpoint: string, context: ClassifierContext, signal: AbortSignal): Promise<Answers> {
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders({ provider, id } as Parameters<ExtensionContext["modelRegistry"]["getApiKeyAndHeaders"]>[0]);
-	if (!auth.ok) throw new Error(auth.error);
-	const headers = new Headers(auth.headers);
-	headers.set("content-type", "application/json");
-	if (auth.apiKey && !headers.has("authorization")) headers.set("authorization", `Bearer ${auth.apiKey}`);
+// ponytail: a fixed 5 minutes from the command's start, not the token's own expiry; a 401 or 403 drops it early, and a
+// shorter-lived token that gets neither fails until then.
+const API_KEY_TTL_MS = 5 * 60_000;
+const API_KEY_COMMAND_TIMEOUT_MS = 10_000;
+const apiKeys = new Map<string, { key: Promise<string>; until: number }>();
+
+/**
+ * autoReview.triage.apiKey: the key as written, or, after a leading "!", what the command prints. A command's key is
+ * kept for API_KEY_TTL_MS, so a token from a CLI (databricks auth token, ...) is not fetched on every call; a failure is
+ * not kept.
+ */
+export function apiKey(setting: string): Promise<string> {
+	if (!setting.startsWith("!")) return Promise.resolve(setting);
+	const cached = apiKeys.get(setting);
+	if (cached !== undefined && cached.until > Date.now()) return cached.key;
+	const key = promisify(exec)(setting.slice(1), { timeout: API_KEY_COMMAND_TIMEOUT_MS, windowsHide: true }).then(
+		({ stdout }) => {
+			const printed = String(stdout).trim();
+			if (printed === "") throw new Error("autoReview.triage.apiKey's command printed nothing.");
+			return printed;
+		},
+		(error: { code?: unknown; signal?: unknown; killed?: boolean }) => {
+			// Only how it ended, for the warning and the log: its stderr, or the command line, can hold a secret.
+			const how = typeof error.code === "string" ? `failed (${error.code})` : error.killed ? `ran over ${API_KEY_COMMAND_TIMEOUT_MS / 1000} s` : error.signal ? `was killed by ${error.signal}` : `exited with code ${error.code}`;
+			throw new Error(`autoReview.triage.apiKey's command ${how}; run it in a shell to see why.`);
+		},
+	);
+	apiKeys.set(setting, { key, until: Date.now() + API_KEY_TTL_MS });
+	key.catch(() => forget(setting, key));
+	return key;
+}
+
+/** Drops a command's key, unless a newer one has replaced it. */
+function forget(setting: string, key: Promise<string>) {
+	if (apiKeys.get(setting)?.key === key) apiKeys.delete(setting);
+}
+
+/** One System One request, POSTed to the endpoint with the API key, in the body pi sends TypeSafe. */
+async function systemOne(model: string, endpoint: string, keySetting: string | undefined, context: ClassifierContext, signal: AbortSignal): Promise<Answers> {
+	const headers = new Headers({ "content-type": "application/json" });
+	const key = keySetting === undefined ? undefined : apiKey(keySetting);
+	if (key !== undefined) {
+		// The command does not take the signal, so the triage timeout or the session's abort ends this wait, not the
+		// command: a later call reuses its key.
+		signal.throwIfAborted();
+		const value = await new Promise<string>((resolve, reject) => {
+			signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+			key.then(resolve, reject);
+		});
+		// Checked here, since the error Headers throws quotes the value.
+		if (/[^\x20-\x7e]/.test(value)) throw new Error("autoReview.triage.apiKey has a character a header cannot carry, such as a line break.");
+		headers.set("authorization", `Bearer ${value}`);
+	}
 	// The wire calls a bool question a noul, and its answer's probability "noul".
 	const questions = Object.fromEntries(Object.entries(context.questions).map(([k, q]) => [k, q.type === "bool" ? { ...q, type: "noul" } : q]));
-	// No redirects: the check on the endpoint must hold for the request that carries the credentials.
-	const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ model: id, state: context.state, questions }), signal, redirect: "error" });
+	// No redirects: the check on the endpoint must hold for the request that carries the key.
+	const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ model, state: context.state, questions }), signal, redirect: "error" });
+	// A rejected key may have expired before its time: the next call runs the command again.
+	if ((response.status === 401 || response.status === 403) && keySetting !== undefined && key !== undefined) forget(keySetting, key);
 	if (!response.ok) throw new Error(`System One returned ${response.status}: ${clip(await response.text(), 200)}`);
 	const { answers } = (await response.json()) as { answers?: Record<string, { noul?: number; probability?: number }> };
 	return Object.fromEntries(Object.entries(answers ?? {}).map(([k, a]) => [k, { ...a, probability: a.probability ?? a.noul }]));
@@ -704,18 +746,18 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		picked = reviewer(ctx, own);
 		if (!useTriage) skipped = "skipped after a block";
 		else if (plannedCall(toolName, input).length > TRIAGE_MAX_CALL_CHARS) skipped = "skipped for a large call";
-		triage = skipped === undefined ? triageModel(ctx, own) : undefined;
+		triage = skipped === undefined ? triageModel(own) : undefined;
 	} catch (error) {
 		return unreviewed(`Cannot read the reviewer from pi's settings.json: ${error instanceof Error ? error.message : error}`);
 	}
 	const { model, reasoning, spec } = picked;
 	// The triage settings as written, so a report shows them even when they were unusable or skipped.
-	// The endpoint stays out: a workspace URL can name the organization.
+	// The endpoint and API key stay out: a workspace URL can name the organization.
 	let triageSetup = "off";
 	if (own.triage?.enabled === true) {
 		const { model: triageSpec, confidence, endpoint } = own.triage;
 		// Clipped and on one line, as written by hand it could be anything and would garble the report's list.
-		triageSetup = clip(`${String(triageSpec)}, confidence ${confidence ?? TRIAGE_CONFIDENCE}`.replace(/\s+/g, " "), 200) + (endpoint ? ", custom endpoint" : "");
+		triageSetup = clip(`${String(triageSpec)}, confidence ${confidence ?? TRIAGE_CONFIDENCE}`.replace(/\s+/g, " "), 200);
 		// The error for a bad endpoint quotes it, so it is masked there too.
 		if (triage !== undefined && "error" in triage) triageSetup += ` (unusable: ${clip(endpoint === undefined ? triage.error : triage.error.replaceAll(JSON.stringify(endpoint), "<endpoint>"), 200)})`;
 		else if (skipped !== undefined) triageSetup += ` (${skipped})`;
