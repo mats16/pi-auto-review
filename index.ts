@@ -32,9 +32,11 @@
  * default. It is called at autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with
  * models.json's credentials: the key itself, or "!" and a command that prints it, whose output is kept five minutes.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
- * the call, the verdict, who decided it, and the triage model's answers and the reviewer's time and tokens. Past 5 MB it
- * moves to pi-auto-review.jsonl.1, replacing the one before; if it cannot be moved, reviews go unlogged. A line over
- * 16,000 characters keeps only the verdict. Off by default.
+ * the call, the verdict, who decided it, and the triage model's answers and tokens and the reviewer's time and tokens.
+ * A block on its own files and a call too large to review get a line of the same shape, decided by the rule or the user;
+ * the calls a rule let run are only counted, by tool and rule, in one line per run; and a session T3 Code runs unreviewed
+ * gets one line naming its mode. Past 5 MB it moves to pi-auto-review.jsonl.1, replacing the one before; if it cannot be
+ * moved, nothing more is logged. A line over 16,000 characters keeps only the verdict. Off by default.
  * /auto-review-report drafts a GitHub issue for one of the last ten verdicts that looks wrong, with the reviewer's model
  * and effort and the triage settings it ran with: the user adds what should have happened, sees the whole draft, and it
  * opens in the browser, where nothing is sent until they submit it.
@@ -420,6 +422,17 @@ export function readOnly(toolName: string, tool: { annotations?: { readOnlyHint?
 	}
 }
 
+/**
+ * The check that let a call run without review, for autoReview.log: needsReview's in its order, and within readOnly,
+ * readOnly's. pi's tool_search counts as read-only, like read; a tool needsReview lets run by name is read-only too.
+ */
+function passedBy(toolName: string, tool: Parameters<typeof readOnly>[1], readOnlyTool: boolean): string {
+	if (READ_ONLY_TOOLS.has(toolName)) return "read-only";
+	if (SCRIPT_TOOLS.has(toolName)) return "codemode";
+	if (readOnlyTool) return tool?.annotations?.readOnlyHint === true ? "readOnlyHint" : toolName === "tool_search" && tool?.sourceInfo?.path === "builtin:tool-search" ? "read-only" : "readOnlyTools";
+	return FILE_TOOLS.has(toolName) ? "cwd-or-tmp" : "read-only";
+}
+
 /** Whether a call must go through the reviewer. */
 export function needsReview(toolName: string, input: Record<string, unknown>, cwd: string, readOnlyHint?: boolean): boolean {
 	if (READ_ONLY_TOOLS.has(toolName) || SCRIPT_TOOLS.has(toolName) || readOnlyHint === true) return false;
@@ -593,7 +606,7 @@ export function reviewer(ctx: ExtensionContext, own: Settings = settings()) {
 
 type Answers = Record<string, { choice?: string; probabilities?: Record<string, number>; probability?: number }>;
 type ClassifierContext = { state: object; questions: Record<string, { type: string }> };
-type Classify = (context: ClassifierContext, signal: AbortSignal) => Promise<Answers>;
+type Classify = (context: ClassifierContext, signal: AbortSignal) => Promise<{ answers: Answers; usage?: object }>;
 
 /**
  * The triage model from autoReview.triage, when "enabled" is true: a classifier that lets routine calls run without
@@ -659,8 +672,11 @@ function forget(setting: string, key: Promise<string>) {
 	if (apiKeys.get(setting)?.key === key) apiKeys.delete(setting);
 }
 
-/** One System One request, POSTed to the endpoint with the API key, in the body pi sends TypeSafe. */
-async function systemOne(model: string, endpoint: string, keySetting: string | undefined, context: ClassifierContext, signal: AbortSignal): Promise<Answers> {
+/**
+ * One System One request, POSTed to the endpoint with the API key, in the body pi sends TypeSafe. Its token counts are
+ * returned as pi names them; Databricks publishes no price for OpenJev, so there is no cost.
+ */
+async function systemOne(model: string, endpoint: string, keySetting: string | undefined, context: ClassifierContext, signal: AbortSignal): Promise<{ answers: Answers; usage?: object }> {
 	const headers = new Headers({ "content-type": "application/json" });
 	const key = keySetting === undefined ? undefined : apiKey(keySetting);
 	if (key !== undefined) {
@@ -682,8 +698,15 @@ async function systemOne(model: string, endpoint: string, keySetting: string | u
 	// A rejected key may have expired before its time: the next call runs the command again.
 	if ((response.status === 401 || response.status === 403) && keySetting !== undefined && key !== undefined) forget(keySetting, key);
 	if (!response.ok) throw new Error(`System One returned ${response.status}: ${clip(await response.text(), 200)}`);
-	const { answers } = (await response.json()) as { answers?: Record<string, { noul?: number; probability?: number }> };
-	return Object.fromEntries(Object.entries(answers ?? {}).map(([k, a]) => [k, { ...a, probability: a.probability ?? a.noul }]));
+	const { answers, usage } = (await response.json()) as { answers?: Record<string, { noul?: number; probability?: number }>; usage?: { input_tokens?: unknown; output_tokens?: unknown } };
+	// Only for the log, so a usage without a token count (null, from some gateways) is left out, not a triage failure, as
+	// pi's own System One client leaves it out.
+	const tokens = (n: unknown) => (typeof n === "number" ? n : undefined);
+	const [input, output] = [tokens(usage?.input_tokens), tokens(usage?.output_tokens)];
+	return {
+		answers: Object.fromEntries(Object.entries(answers ?? {}).map(([k, a]) => [k, { ...a, probability: a.probability ?? a.noul }])),
+		...((input ?? output) !== undefined && { usage: { input, output } }),
+	};
 }
 
 /**
@@ -781,12 +804,12 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		const timeout = AbortSignal.timeout(TRIAGE_TIMEOUT_MS);
 		const sent = Date.now();
 		try {
-			const answers = await triage.classify(
+			const { answers, usage } = await triage.classify(
 				{ state: triageState(lines, ctx.cwd, toolName, input), questions: TRIAGE_QUESTIONS },
 				ctx.signal ? AbortSignal.any([timeout, ctx.signal]) : timeout,
 			);
 			const cleared = routine(answers, triage.confidence);
-			record.triage = { model: triage.spec, ms: Date.now() - sent, routine: cleared, answers };
+			record.triage = { model: triage.spec, ms: Date.now() - sent, routine: cleared, answers, usage };
 			if (cleared) {
 				record.by = "triage";
 				return done({ outcome: "allow", risk: "low", authorization: "unknown", reason: `Routine (${triage.spec}: ${likeliestRoutine(answers)}).` });
@@ -806,12 +829,14 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 }
 
 /**
- * Appends one review to pi-auto-review.jsonl in pi's agent directory, for analysis: how many calls the triage model
- * cleared, how long the reviewer took, and what it cost. A failed write is dropped: it must not change the verdict.
+ * Appends one review, or a call decided without one, to pi-auto-review.jsonl in pi's agent directory, for analysis:
+ * how many calls the triage model cleared, how long the reviewer took, and what it cost. A failed write is dropped: it
+ * must not change the verdict.
  */
 // ponytail: the call goes in as the agent wrote it (clipped), secrets included; delete the files to reset.
-function log(ctx: ExtensionContext, toolName: string, input: unknown, verdict: Verdict, record: { by?: string }, started: number) {
+function log(ctx: ExtensionContext, toolName: string, input: unknown, verdict: Pick<Verdict, "outcome" | "reason"> & Partial<Verdict>, record: { by?: string; rule?: string }, started: number) {
 	try {
+		// A call decided by a rule or the user was not rated, so it has no risk or authorization.
 		const { outcome, risk, authorization, reason } = verdict;
 		// The reason can hold a gateway's whole error page: clipped, the line keeps its start.
 		const head = { time: new Date(started).toISOString(), session: ctx.sessionManager.getSessionId?.(), cwd: ctx.cwd, tool: toolName, outcome, risk, authorization };
@@ -819,6 +844,22 @@ function log(ctx: ExtensionContext, toolName: string, input: unknown, verdict: V
 		// Anything else, such as the answers a custom triage endpoint sent, is as long as it came: past the limit, the
 		// line keeps only the verdict.
 		if (line.length > MAX_LOG_LINE_CHARS) line = JSON.stringify({ ...head, by: record.by, oversized: line.length });
+		append(line);
+	} catch {}
+}
+
+/** Whether autoReview.log is on, for the lines written outside a review; settings that cannot be read log nothing. */
+function logging(): boolean {
+	try {
+		return settings().log === true;
+	} catch {
+		return false;
+	}
+}
+
+/** Appends one line to pi-auto-review.jsonl, moving it to .1 past 5 MB. A failed write is dropped. */
+function append(line: string) {
+	try {
 		const file = join(agentDir(), "pi-auto-review.jsonl");
 		const size = () => statSync(file, { throwIfNoEntry: false })?.size ?? 0;
 		// Several pi processes can share the file, so each line is one append, and the size is checked again after the
@@ -882,7 +923,13 @@ export default function autoReview(pi: ExtensionAPI) {
 	// In T3 Code, review only in Supervised and Auto-accept edits. Full access runs everything, as in Codex, and any other
 	// mode keeps the bridge's own prompts. Plain pi has no mode and is always reviewed.
 	const t3Mode = process.env.T3_PI_RUNTIME_MODE;
-	if (t3Mode !== undefined && t3Mode !== "approval-required" && t3Mode !== "auto-accept-edits") return;
+	if (t3Mode !== undefined && t3Mode !== "approval-required" && t3Mode !== "auto-accept-edits") {
+		// One line per session start, so the log tells a session that ran unreviewed from one that made no calls.
+		pi.on("session_start", (_event, ctx) => {
+			if (logging()) append(JSON.stringify({ time: new Date().toISOString(), session: ctx.sessionManager.getSessionId?.(), cwd: ctx.cwd, by: "mode", mode: t3Mode }));
+		});
+		return;
+	}
 	if (t3Mode !== undefined) {
 		// The bridge would ask about every call itself; the reviewer takes that over. It reads an unset mode as full
 		// access, and child processes then see plain pi, which still reviews.
@@ -908,11 +955,24 @@ export default function autoReview(pi: ExtensionAPI) {
 	let reviews: { toolName: string; input: unknown; verdict: Verdict }[] = [];
 	// ponytail: warns about the triage model once per load, so a later, different problem with it goes unshown.
 	let warned = false;
-	pi.on("agent_start", () => {
+	// The calls a rule let run in this run, by rule and tool: only counted, since the log would otherwise fill with reads.
+	// ponytail: written at agent_end (or the next agent_start), so a process that dies mid-run loses its counts.
+	let passed: Record<string, Record<string, number>> = {};
+	let runStarted = Date.now();
+	const flush = (ctx: ExtensionContext) => {
+		if (Object.keys(passed).length > 0 && logging()) {
+			append(JSON.stringify({ time: new Date(runStarted).toISOString(), session: ctx.sessionManager.getSessionId?.(), cwd: ctx.cwd, by: "rule", passed }));
+		}
+		passed = {};
+		runStarted = Date.now();
+	};
+	pi.on("agent_start", (_event, ctx) => {
+		flush(ctx);
 		consecutive = 0;
 		recent = [];
 		blockedThisRun = false;
 	});
+	pi.on("agent_end", (_event, ctx) => flush(ctx));
 
 	pi.on("tool_call", async (event, ctx) => {
 		/** Every block goes through here, so any block, by a review or by the user, turns triage off for the run. */
@@ -920,25 +980,40 @@ export default function autoReview(pi: ExtensionAPI) {
 			blockedThisRun = true;
 			return { block: true, reason };
 		};
+		/** A call decided without review, logged in a review's shape, by the rule or the user that decided it. */
+		const decided = (outcome: "allow" | "deny", reason: string, by: string, rule: string, started = Date.now()) => {
+			if (logging()) log(ctx, event.toolName, event.input, { outcome, reason }, { by, rule }, started);
+		};
 		if (touches(SELF_DIR, event.toolName, event.input, ctx.cwd)) {
 			// Calls on this extension's own files skip the reviewer, so the agent cannot talk it into them, and are blocked
 			// without asking, so an unattended run is not left waiting. The block names the folder and, unless the call is an
 			// edit or write, the tools that read it without asking: the agent, not this check, tells whether its call only reads.
 			const own = SELF_DIR.replace(homedir(), "~");
 			const hint = FILE_TOOLS.has(event.toolName) ? "" : " To only read these files, use read, grep, find, or ls instead: they run without asking.";
+			decided("deny", "Calls on pi-auto-review's own files are blocked.", "rule", "own files");
 			return block(
 				`pi-auto-review: calls on its own files (${own}) are never left to the reviewer, so it did not run. Do not retry it in another form to get around this.${hint} To change these files, stop and tell the user: they can make the change themselves, or allow it outside pi-auto-review (Full access in T3 Code).`,
 			);
 		}
 		const tool = pi.getAllTools().find((t) => t.name === event.toolName);
-		if (!needsReview(event.toolName, event.input, ctx.cwd, readOnly(event.toolName, tool))) return;
+		const readOnlyTool = readOnly(event.toolName, tool);
+		if (!needsReview(event.toolName, event.input, ctx.cwd, readOnlyTool)) {
+			const rule = passedBy(event.toolName, tool, readOnlyTool);
+			// Without a prototype, so a tool named constructor or __proto__ is counted like any other.
+			const counts: Record<string, number> = (passed[rule] ??= Object.create(null));
+			counts[event.toolName] = (counts[event.toolName] ?? 0) + 1;
+			return;
+		}
 		if (plannedCall(event.toolName, event.input).length > MAX_CALL_CHARS) {
 			// The reviewer must see a call whole, or a risky tail runs unseen; as in Codex, one past its budget asks the user,
 			// shown whole, or is blocked without a UI.
 			const why = `pi-auto-review: this call is too large to review (over ${MAX_CALL_CHARS} characters).`;
+			const started = Date.now();
 			// T3 Code reads the tool name from this exact title to label the approval.
-			if (ctx.hasUI && (await ctx.ui.confirm(`Allow ${event.toolName}?`, `${why}\n\n${plannedCall(event.toolName, event.input)}`))) return;
-			const next = ctx.hasUI ? "The user declined it." : "Only the user can approve it, from an interactive session.";
+			const allowed = ctx.hasUI && (await ctx.ui.confirm(`Allow ${event.toolName}?`, `${why}\n\n${plannedCall(event.toolName, event.input)}`));
+			const next = allowed ? "The user allowed it." : ctx.hasUI ? "The user declined it." : "Only the user can approve it, from an interactive session.";
+			decided(allowed ? "allow" : "deny", `${why} ${next}`, ctx.hasUI ? "user" : "rule", "too large", started);
+			if (allowed) return;
 			return block(`${why} ${next} Do not retry it in another form to get around this.`);
 		}
 

@@ -387,7 +387,7 @@ async function triaged(classify: () => Promise<object>, triage: object = {}, sig
 	const ctx: any = fakeCtx('{"outcome":"allow"}', seen);
 	if (signal) ctx.signal = signal;
 	const realFetch = globalThis.fetch;
-	globalThis.fetch = (async () => (seen.push("triage"), new Response(JSON.stringify({ answers: await classify() })))) as any;
+	globalThis.fetch = (async () => (seen.push("triage"), new Response(JSON.stringify({ answers: await classify(), usage: { input_tokens: 50, output_tokens: 0 } })))) as any;
 	try {
 		return { verdict: await review(ctx, "bash", { command }), seen, ctx };
 	} finally {
@@ -470,6 +470,7 @@ test("autoReview.log appends each review to pi-auto-review.jsonl: who decided, t
 		assert.deepEqual([cleared.by, cleared.tool, cleared.call, cleared.outcome, cleared.triage.routine, cleared.reviewer], ["triage", "bash", "ls", "allow", true, undefined]);
 		assert.equal(cleared.triage.answers.kind.probabilities.read, 0.9);
 		assert.equal(typeof cleared.triage.ms, "number");
+		assert.deepEqual(cleared.triage.usage, { input: 50, output: 0 }); // under pi's names; Databricks publishes no price for OpenJev
 		assert.deepEqual([reviewed.by, reviewed.triage.routine, reviewed.reviewer.effort, reviewed.reviewer.usage], ["reviewer", false, "high", { input: 10, output: 2 }]);
 		assert.equal(typeof reviewed.reviewer.ms, "number");
 		assert.deepEqual([failed.by, failed.triage.error], ["reviewer", "429"]); // the error itself, not the warning around it
@@ -520,15 +521,16 @@ test("autoReview.log appends each review to pi-auto-review.jsonl: who decided, t
 test("the triage model is called at its endpoint, as is, as System One, with the API key from settings.json", async () => {
 	const runs = join(agentDir, "key-runs");
 	const command = `!echo run >> ${runs}; echo k`;
-	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { triage: { enabled: true, model: "openjev", endpoint: "https://gw.example/beta/systemone?v=2", apiKey: command } } }));
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { log: true, triage: { enabled: true, model: "openjev", endpoint: "https://gw.example/beta/systemone?v=2", apiKey: command } } }));
 	const fetched: any[] = [];
 	let status = 200;
+	let usage: unknown = { input_tokens: 47, output_tokens: 0 };
 	const realFetch = globalThis.fetch;
 	globalThis.fetch = (async (url: string, init: any) => {
 		fetched.push({ url, auth: init.headers.get("authorization"), body: JSON.parse(init.body), redirect: init.redirect });
 		if (status !== 200) return new Response(status === 401 ? "expired" : "rate limited", { status });
 		const kind = { type: "choice", choice: "edit", probabilities: { edit: 0.95, read: 0.05 }, confidence: 0.9 };
-		return new Response(JSON.stringify({ answers: { kind, has_secret: { type: "noul", noul: 0.02 }, loosens: { type: "noul", noul: 0.04 } } }));
+		return new Response(JSON.stringify({ answers: { kind, has_secret: { type: "noul", noul: 0.02 }, loosens: { type: "noul", noul: 0.04 } }, usage }));
 	}) as any;
 	const seen: string[] = [];
 	const ctx: any = fakeCtx('{"outcome":"deny"}', seen);
@@ -543,6 +545,8 @@ test("the triage model is called at its endpoint, as is, as System One, with the
 		assert.equal(fetched[0].redirect, "error"); // a redirect must not carry the key past the https check
 		assert.equal(fetched[0].body.model, "openjev");
 		assert.deepEqual([fetched[0].body.questions.kind.type, fetched[0].body.questions.has_secret.type], ["choice", "noul"]); // the wire's name for bool
+		const logged = () => JSON.parse(readFileSync(join(agentDir, "pi-auto-review.jsonl"), "utf8").trim().split("\n").at(-1)!);
+		assert.deepEqual(logged().triage.usage, { input: 47, output: 0 }); // under pi's names, with no cost
 		await call();
 		assert.equal(readFileSync(runs, "utf8"), "run\n"); // the command's key is kept
 		status = 429;
@@ -557,10 +561,15 @@ test("the triage model is called at its endpoint, as is, as System One, with the
 			await call();
 		}
 		assert.equal(readFileSync(runs, "utf8"), "run\nrun\nrun\n");
+		// A usage without a token count is only left out of the log: the triage model still clears the call.
+		for (usage of [null, "n/a", [], {}, { input_tokens: "47" }]) {
+			assert.equal((await call()).setup?.by, "triage");
+			assert.deepEqual([logged().by, "usage" in logged().triage], ["triage", false]);
+		}
 	} finally {
 		globalThis.fetch = realFetch;
 		rmSync(runs, { force: true });
-		rmSync(join(agentDir, "settings.json"));
+		for (const path of ["settings.json", "pi-auto-review.jsonl"]) rmSync(join(agentDir, path), { force: true });
 	}
 });
 
@@ -632,7 +641,8 @@ function load(mode: string | undefined): Record<string, any> {
 	const handlers: Record<string, any> = {};
 	autoReview({
 		on: (event: string, handler: any) => (handlers[event] = handler),
-		getAllTools: () => [],
+		// grep and edit as another extension could annotate them, so the log names the check that let them run.
+		getAllTools: () => [...["mcp_lookup", "grep", "edit", "constructor"].map((name) => ({ name, annotations: { readOnlyHint: true } })), { name: "tool_search", sourceInfo: { path: "builtin:tool-search" } }],
 		registerCommand: (name: string, command: any) => (handlers[`/${name}`] = command.handler),
 		sendMessage: (message: any) => (handlers.sent ??= []).push(message),
 		// Never settles, like xdg-open waiting on the browser it started: /auto-review-report must not wait on it.
@@ -894,9 +904,72 @@ test("a reload hands T3's prompts back until the extension loads again", async (
 });
 
 test("Full access runs everything unreviewed, as in Codex, and other T3 modes keep the bridge's prompts", () => {
-	for (const mode of ["full-access", "auto", ""]) {
-		assert.deepEqual(load(mode), {});
-		assert.equal(process.env.T3_PI_RUNTIME_MODE, mode); // the bridge keeps the mode
+	const file = join(agentDir, "pi-auto-review.jsonl");
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { log: true } }));
+	try {
+		for (const mode of ["full-access", "auto", ""]) {
+			const handlers = load(mode);
+			assert.deepEqual(Object.keys(handlers), ["session_start"]); // nothing reviewed, only the session noted
+			assert.equal(process.env.T3_PI_RUNTIME_MODE, mode); // the bridge keeps the mode
+			handlers.session_start({ type: "session_start", reason: "startup" }, fakeCtx("", []));
+		}
+		const lines = readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.deepEqual(lines.map(({ by, mode, cwd }) => ({ by, mode, cwd })), ["full-access", "auto", ""].map((mode) => ({ by: "mode", mode, cwd })));
+	} finally {
+		for (const path of [file, join(agentDir, "settings.json")]) rmSync(path, { force: true });
+	}
+});
+
+test("autoReview.log notes calls decided without review: blocks on the extension's own files and calls too large to review in a review's shape, and the calls a rule let run as counts per run", async () => {
+	const file = join(agentDir, "pi-auto-review.jsonl");
+	const lines = () => readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { log: true, readOnlyTools: ["mcp__t3-code__t3_thread_wait"] } }));
+	try {
+		const handlers = load(undefined);
+		const call = (toolName: string, input: object, hasUI = true, approve = false) => handlers.tool_call({ toolName, input }, fakeCtx('{"outcome":"allow"}', [], hasUI, approve));
+		await handlers.agent_start({ type: "agent_start" }, fakeCtx("", []));
+		for (const [tool, input] of [
+			["read", { path: "/etc/hosts" }],
+			["read", { path: "secret.env" }],
+			["grep", { pattern: "TODO" }],
+			["write", { path: "/tmp/notes.txt", content: "token=abc" }],
+			["codemode", { code: "return 1" }],
+			["mcp_lookup", { q: "x" }],
+			["edit", { path: "/etc/hosts" }], // runs for its readOnlyHint, not as an edit inside the working directory
+			["constructor", {}], // an MCP tool can be named anything
+			["tool_search", { query: "slack" }], // pi's own, which runs like read
+			["mcp__t3-code__t3_thread_wait", {}],
+		] as const) {
+			await call(tool, input);
+		}
+		assert.equal(existsSync(file), false); // counted, not yet written
+		await call("bash", { command: `cat ${import.meta.dirname}/index.ts` });
+		const big = { command: `printf '${"x".repeat(MAX_CALL_FOR_TEST)}'` };
+		await call("bash", big, true, true);
+		await call("bash", big, true, false);
+		await call("bash", big, false);
+		await handlers.agent_end({ type: "agent_end", messages: [] }, fakeCtx("", []));
+		const [own, allowed, declined, headless, counts] = lines();
+		assert.deepEqual([own.tool, own.outcome, own.by, own.rule, own.risk, own.call], ["bash", "deny", "rule", "own files", undefined, `cat ${import.meta.dirname}/index.ts`]);
+		assert.deepEqual([allowed.outcome, allowed.by, allowed.rule], ["allow", "user", "too large"]);
+		assert.match(allowed.reason, /too large to review.*The user allowed it/);
+		assert.deepEqual([declined.outcome, declined.by, headless.outcome, headless.by], ["deny", "user", "deny", "rule"]);
+		assert.ok(allowed.call.length < 600); // clipped, as a review's call
+		// Only the counts: no call, so no path or content a rule let through.
+		assert.deepEqual(counts.passed, { "read-only": { read: 2, grep: 1, tool_search: 1 }, readOnlyTools: { "mcp__t3-code__t3_thread_wait": 1 }, "cwd-or-tmp": { write: 1 }, codemode: { codemode: 1 }, readOnlyHint: { mcp_lookup: 1, edit: 1, constructor: 1 } });
+		assert.deepEqual([counts.by, counts.cwd, counts.call, counts.tool], ["rule", cwd, undefined, undefined]);
+		assert.equal(statSync(file).mode & 0o777, 0o600);
+		// A run with nothing a rule let through adds no line, and with the log off nothing is written.
+		await handlers.agent_end({ type: "agent_end", messages: [] }, fakeCtx("", []));
+		assert.equal(lines().length, 5);
+		rmSync(file);
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: {} }));
+		await call("read", { path: "a" });
+		await call("bash", { command: `cat ${import.meta.dirname}/index.ts` });
+		await handlers.agent_end({ type: "agent_end", messages: [] }, fakeCtx("", []));
+		assert.equal(existsSync(file), false);
+	} finally {
+		for (const path of [file, join(agentDir, "settings.json")]) rmSync(path, { force: true });
 	}
 });
 
