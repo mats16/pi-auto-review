@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import autoReview, { approvalDetails, approvalMessage, issue, issueUrl, triageModel, triageState, needsReview, parseVerdict, review, reviewer, routine, touches, transcript } from "./index.ts";
+import autoReview, { approvalDetails, approvalMessage, issue, issueUrl, triageModel, triageState, needsReview, parseVerdict, readOnly, review, reviewer, routine, touches, transcript } from "./index.ts";
 
 const cwd = "/work/project";
 // The reviewer reads pi's user settings.json; keep the user's own out of every test.
@@ -101,6 +101,25 @@ test("needsReview resolves paths like pi's file tools", () => {
 	assert.equal(needsReview("write", { path: "file:///etc/hosts" }, cwd), true);
 	assert.equal(needsReview("edit", { path: "@src/a.ts" }, cwd), false);
 	assert.equal(needsReview("edit", { path: "..notes.md" }, cwd), true); // dot path, still reviewed
+});
+
+test("readOnly trusts readOnlyHint, pi's own tool_search, and the names in the user's autoReview.readOnlyTools", () => {
+	assert.equal(readOnly("mcp__docs__search", { annotations: { readOnlyHint: true } }, {}), true);
+	assert.equal(readOnly("mcp__docs__search", { annotations: { readOnlyHint: false } }, {}), false);
+	assert.equal(readOnly("tool_search", { sourceInfo: { path: "builtin:tool-search" } }, {}), true);
+	// An extension that replaces tool_search keeps the name.
+	assert.equal(readOnly("tool_search", { sourceInfo: { path: "/home/u/.pi/agent/extensions/search.ts" } }, {}), false);
+	assert.equal(readOnly("tool_search", undefined, {}), false);
+	const own = { readOnlyTools: ["mcp__t3-code__t3_thread_wait"] };
+	assert.equal(readOnly("mcp__t3-code__t3_thread_wait", undefined, own), true);
+	assert.equal(readOnly("mcp__t3-code__t3_thread_send", undefined, own), false);
+	assert.equal(readOnly("mcp__t3-code__t3_thread_wait", undefined, { readOnlyTools: "mcp__t3-code__t3_thread_wait" }), false); // not a list
+	// From settings.json, where a file that cannot be read trusts no name.
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: own }));
+	assert.equal(readOnly("mcp__t3-code__t3_thread_wait", undefined), true);
+	writeFileSync(join(agentDir, "settings.json"), "{");
+	assert.equal(readOnly("mcp__t3-code__t3_thread_wait", undefined), false);
+	rmSync(join(agentDir, "settings.json"));
 });
 
 test("parseVerdict reads Codex's verdict JSON, even inside a code fence", () => {
@@ -634,6 +653,22 @@ test("a task for a pi subagent that names the extension's folder goes to the rev
 	assert.deepEqual(await call({ task, mode: "async" }), [false, ["review:high"]]);
 	assert.deepEqual(await call({ task, target: { providerInstanceId: "codex" } }), [true, []]);
 	assert.deepEqual(await call({ task, runtimeMode: "full-access" }), [true, []]);
+});
+
+test("a tool named in autoReview.readOnlyTools runs without the reviewer, unless it names the extension's folder", async () => {
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { readOnlyTools: ["mcp__t3-code__t3_thread_wait"] } }));
+	try {
+		const call = async (toolName: string, input: object) => {
+			const seen: string[] = [];
+			const result = await load("approval-required").tool_call({ toolName, input }, fakeCtx('{"outcome":"allow"}', seen));
+			return [result?.block === true, seen];
+		};
+		assert.deepEqual(await call("mcp__t3-code__t3_thread_wait", { threadId: "t1" }), [false, []]);
+		assert.deepEqual(await call("mcp__t3-code__t3_thread_send", { threadId: "t1", message: "hi" }), [false, ["review:high"]]);
+		assert.deepEqual(await call("mcp__t3-code__t3_thread_wait", { threadId: `${import.meta.dirname}/index.ts` }), [true, []]);
+	} finally {
+		rmSync(join(agentDir, "settings.json"));
+	}
 });
 
 test("a call too large for the reviewer to see whole goes to the user, never to the reviewer", async () => {

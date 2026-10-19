@@ -1,8 +1,9 @@
 /**
  * pi-auto-review: an AI reviewer for pi tool calls, after Codex's auto-review ("Approve for me").
  *
- * Read-only tools and edits to ordinary files inside the working directory or under /tmp run as-is, and so does pi's
- * codemode script, whose tool calls are each checked as below.
+ * Read-only tools (pi's read, grep, find, ls, and tool_search, tools annotated readOnlyHint, and those the user names in
+ * autoReview.readOnlyTools) and edits to ordinary files inside the working directory or under /tmp run as-is, and so does
+ * pi's codemode script, whose tool calls are each checked as below.
  * Every other call (bash, edits elsewhere, MCP and custom tools) goes to a reviewer model first, with the session's
  * transcript: the user's messages are trusted, the rest is untrusted evidence. As in Codex, the reviewer rates the
  * call's risk and the user's authorization for it, and decides: low and medium run, high runs only with the user's
@@ -396,6 +397,25 @@ function textForCheckedAgent(toolName: string, input: Record<string, unknown>): 
 	return (target.providerInstanceId ?? null) === null && (target.driverKind ?? null) === null;
 }
 
+/**
+ * Whether a registered tool only reads: annotated readOnlyHint, pi's own tool_search (it ranks tool descriptions on this
+ * machine and loads the matches, whose calls are checked on their own), or named in autoReview.readOnlyTools in the
+ * user's settings.json. A settings.json that cannot be read trusts no name.
+ */
+// ponytail: autoReview.readOnlyTools trusts names, so a tool another extension registers under one runs unreviewed, as
+// codemode does; it is for tools whose server does not pass on readOnlyHint (T3 Code's pi bridge drops it).
+export function readOnly(toolName: string, tool: { annotations?: { readOnlyHint?: boolean }; sourceInfo?: { path?: string } } | undefined, own?: Settings): boolean {
+	if (tool?.annotations?.readOnlyHint === true) return true;
+	// An extension that replaces tool_search keeps the name, so only pi's own counts.
+	if (toolName === "tool_search" && tool?.sourceInfo?.path === "builtin:tool-search") return true;
+	try {
+		const names = (own ?? settings()).readOnlyTools;
+		return Array.isArray(names) && names.includes(toolName);
+	} catch {
+		return false;
+	}
+}
+
 /** Whether a call must go through the reviewer. */
 export function needsReview(toolName: string, input: Record<string, unknown>, cwd: string, readOnlyHint?: boolean): boolean {
 	if (READ_ONLY_TOOLS.has(toolName) || SCRIPT_TOOLS.has(toolName) || readOnlyHint === true) return false;
@@ -525,7 +545,7 @@ function unreviewed(reason: string): Verdict {
  * autoReview in pi's user settings.json. Only the user's file counts: pi merges a project's .pi/settings.json into its
  * settings, and a project must not pick its own reviewer. Throws if the file exists but cannot be read.
  */
-type Settings = { model?: unknown; effort?: unknown; triage?: Record<string, unknown>; log?: unknown };
+type Settings = { model?: unknown; effort?: unknown; triage?: Record<string, unknown>; log?: unknown; readOnlyTools?: unknown };
 
 // ponytail: mirrors pi's getAgentDir (imports stay type-only); recheck when pi moves its agent directory.
 function agentDir(): string {
@@ -867,8 +887,8 @@ export default function autoReview(pi: ExtensionAPI) {
 				`pi-auto-review: calls on its own files (${own}) are never left to the reviewer, so it did not run. Do not retry it in another form to get around this.${hint} To change these files, stop and tell the user: they can make the change themselves, or allow it outside pi-auto-review (Full access in T3 Code).`,
 			);
 		}
-		const readOnlyHint = pi.getAllTools().find((tool) => tool.name === event.toolName)?.annotations?.readOnlyHint;
-		if (!needsReview(event.toolName, event.input, ctx.cwd, readOnlyHint)) return;
+		const tool = pi.getAllTools().find((t) => t.name === event.toolName);
+		if (!needsReview(event.toolName, event.input, ctx.cwd, readOnly(event.toolName, tool))) return;
 		if (plannedCall(event.toolName, event.input).length > MAX_CALL_CHARS) {
 			// The reviewer must see a call whole, or a risky tail runs unseen; as in Codex, one past its budget asks the user,
 			// shown whole, or is blocked without a UI.
