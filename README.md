@@ -122,7 +122,13 @@ All three keep most reviews under a second. Higher values also move the calls th
 
 ### Review log (off by default)
 
-`"log": true` in `autoReview` appends one JSON line per review to `pi-auto-review.jsonl` in pi's agent directory (`~/.pi/agent/`), next to pi's own `mcp.log` and `pi-debug.log`, to see how many calls the triage model clears and how the reviewer responds. As with `mcp.log`, past 5 MB the file moves to `pi-auto-review.jsonl.1`, replacing the one before, so the two take at most about 10 MB; if the file cannot be moved, reviews stop being logged. Calls that run or go to you without review are not logged.
+`"log": true` in `autoReview` appends one JSON line per review to `pi-auto-review.jsonl` in pi's agent directory (`~/.pi/agent/`), next to pi's own `mcp.log` and `pi-debug.log`, to see how many calls the triage model clears and how the reviewer responds. Calls decided without review are logged too, so the file alone shows what happened:
+
+- A call blocked on pi-auto-review's own files, and a call too large to review, get a line of the same shape, with `by` saying who decided: `rule`, or `user` with your answer as the `outcome`.
+- The calls a rule let run (`read`, `grep`, `find`, `ls`, `tool_search`, `codemode`, `edit` / `write` inside the working directory or `/tmp`, `readOnlyHint` tools, `autoReview.readOnlyTools`) are only counted, by rule and tool, in one line at the end of each run, without the calls: they are most of an agent's calls (a third of them `read`s), and a line each would fill the file with paths and contents.
+- A session T3 Code runs unreviewed (Full access, or a mode that keeps the bridge's prompts) gets one line when it starts, naming its mode.
+
+As with `mcp.log`, past 5 MB the file moves to `pi-auto-review.jsonl.1`, replacing the one before, so the two take at most about 10 MB; if the file cannot be moved, nothing more is logged.
 
 ```json
 { "autoReview": { "model": "databricks-oss/system.ai.glm-5-3-flash", "log": true } }
@@ -130,17 +136,21 @@ All three keep most reviews under a second. Higher values also move the calls th
 
 | Field | Meaning |
 |---|---|
-| `time`, `session`, `cwd`, `tool`, `call` | When the review started, in which session, and the call (a bash command as is, clipped to 500 characters). `npm run eval` leaves `session` out. |
-| `outcome`, `risk`, `authorization`, `reason` | The verdict. `risk` is `unknown` when the review failed. |
-| `by` | `triage` when the triage model cleared the call, `reviewer` when the reviewer was asked. Missing when neither answered: no reviewer model was found, or the session was aborted during triage. |
-| `ms` | The whole review, in milliseconds. |
-| `triage` | `model`, `ms`, `routine`, and its `answers` (probabilities), or its `error` message; `"skipped after a block"` when a block earlier in the run left the call to the reviewer, `"skipped for a large call"` when the call was over 32,000 characters. |
+| `time`, `session`, `cwd`, `tool`, `call` | When the review (or the run, for counts) started, in which session, and the call (a bash command as is, clipped to 500 characters). `npm run eval` leaves `session` out. Counts and mode lines have no `tool` or `call`. |
+| `outcome`, `risk`, `authorization`, `reason` | The verdict. `risk` is `unknown` when the review failed; a call decided by `rule` or `user` was not rated, so it has no `risk` or `authorization`. |
+| `by` | `triage` when the triage model cleared the call, `reviewer` when the reviewer was asked, `rule` when a rule decided it (or counted the calls in `passed`), `user` when you were asked, `mode` for a session T3 Code runs unreviewed. Missing when neither model answered: no reviewer model was found, or the session was aborted during triage. |
+| `rule` | With `by` `rule` or `user`: `own files` (a call on pi-auto-review's own files, blocked) or `too large` (over 128,000 characters, asked or, without a UI, blocked). |
+| `passed` | The calls a rule let run in the run, by rule and tool: `read-only` (`read`, `grep`, `find`, `ls`, pi's `tool_search`), `readOnlyHint`, `readOnlyTools` (named in `autoReview.readOnlyTools`), `codemode`, `cwd-or-tmp` (an `edit` or `write` inside the working directory or `/tmp`), as `{"read-only": {"read": 12, "grep": 3}}`. |
+| `mode` | With `by` `mode`: T3 Code's mode (`full-access`, ...). |
+| `ms` | The whole review, or how long you took to answer, in milliseconds. |
+| `triage` | `model`, `ms`, `routine`, its `answers` (probabilities), and `usage` (input and output tokens, when the endpoint reports them; no cost, since Databricks publishes no price for OpenJev), or its `error` message; `"skipped after a block"` when a block earlier in the run left the call to the reviewer, `"skipped for a large call"` when the call was over 32,000 characters. |
 | `reviewer` | `model`, `effort`, `ms`, and `usage` (tokens and cost, as the provider reports them). |
 
 ```bash
-# How many reviews each side decided, and the reviewer's median time
-jq -s 'group_by(.by) | map({by: .[0].by, n: length})' ~/.pi/agent/pi-auto-review.jsonl
+# How many calls each side decided, the calls a rule let run counted in; the reviewer's median time; triage input tokens
+jq -s 'map(select(.by != "mode") | if .passed then {by, n: ([.passed[][]] | add)} else {by, n: 1} end) | group_by(.by) | map({by: .[0].by, n: (map(.n) | add)})' ~/.pi/agent/pi-auto-review.jsonl
 jq -s '[.[] | .reviewer.ms // empty] | sort | .[length/2|floor]' ~/.pi/agent/pi-auto-review.jsonl
+jq -s '[.[] | .triage.usage.input // empty] | add' ~/.pi/agent/pi-auto-review.jsonl
 ```
 
 ## Report a misjudgment
@@ -182,7 +192,7 @@ T3 Code starts pi in **Auto** as it does in Supervised, so pi-auto-review review
 - The triage model sees only your messages and the call. Until a call is blocked in the run, it cannot see what the agent did before, such as a script it wrote that the call runs.
 - The triage model reads the call's text, which the agent wrote, and small classifiers do not treat it as hostile: text in a call can talk it into rating the call routine, and the call then runs without the reviewer. It also sees only your messages and the call, not the agent's words or tool output, so it cannot tell when untrusted content steered the agent; the reviewer can. This is why it is off by default.
 - The triage model's questions were tuned on the eval's own cases, and the default `confidence` and the 0.2 for its two flags were chosen on its answers to those, the history, and cases written later; few of the calls that should ask came close. Its answers shift with the order of their options and the model's version. Rerun `npm run eval` when you change either.
-- The review log keeps each call as the agent wrote it, and the reviewer's reason, which can quote it, secrets included: delete `pi-auto-review.jsonl` and its `.1` to start over. Only you can read a file it creates. It keeps at most about 10 MB, so older reviews are lost; copy the `.1` away to keep them. If the file cannot be moved to `.1`, reviews stop being logged rather than letting it grow. The call, the reason, and errors keep their first 500 characters, and a line still over 16,000 characters, such as one with a custom triage endpoint's oversized answers, keeps only the verdict. Two pi processes rotating it at the same moment can replace the full `.1` with a nearly empty one. A failed write is skipped without notice.
+- The review log keeps each call as the agent wrote it, and the reviewer's reason, which can quote it, secrets included: delete `pi-auto-review.jsonl` and its `.1` to start over. Only you can read a file it creates. It keeps at most about 10 MB, so older reviews are lost; copy the `.1` away to keep them. If the file cannot be moved to `.1`, reviews stop being logged rather than letting it grow. The call, the reason, and errors keep their first 500 characters, and a line still over 16,000 characters, such as one with a custom triage endpoint's oversized answers, keeps only the verdict. Two pi processes rotating it at the same moment can replace the full `.1` with a nearly empty one. A failed write is skipped without notice. The calls a rule let run are counted in memory and written when the run ends, so a pi process that dies mid-run loses that run's counts. The triage model's tokens are logged but not its cost.
 - The triage model's `apiKey` takes the key itself or a `!` command, not pi's `$NAME` environment variables. A command's key is reused for 5 minutes whatever its expiry, so a token that lasts less (and is not rejected with a 401 or 403) fails triage calls until then; the reviewer judges them. The first call after the 5 minutes waits for the command.
 - Databricks limits OpenJev's input tokens per minute for a workspace. Over the limit, the reviewer judges the calls, so reviews slow down but do not fail.
 
