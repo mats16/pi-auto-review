@@ -7,7 +7,7 @@ AI auto-review for [pi](https://pi.dev) tool calls, after Codex's auto-review ("
 | Tool call | What happens |
 |---|---|
 | Calls on pi-auto-review's own files: `edit` / `write` under its folder (as named, or through a symlink into it) or whose place cannot be told (a symlink that leads nowhere, a file with hard links), or any other call except `read`, `grep`, `find`, `ls`, `codemode`, `compact_context`, and a `mcp__t3-code__delegate_task` to a pi subagent that names the folder | Blocked, without review and without asking you. The agent is told the folder and, unless the call is an `edit` or `write`, that `read`, `grep`, `find`, and `ls` read it without asking, so it retries a call that only reads with them; to change the files, it stops and tells you |
-| `read`, `grep`, `find`, `ls`, and tools annotated `readOnlyHint` | Runs |
+| `read`, `grep`, `find`, `ls`, pi's own `tool_search`, tools annotated `readOnlyHint`, and tools you name in [`autoReview.readOnlyTools`](#read-only-tools) | Runs |
 | pi's `codemode` script | Runs: it is sandboxed (no file system or network), and each tool it calls goes through this table on its own |
 | `edit` / `write` to an ordinary file inside the working directory or under `/tmp`, symlinks followed | Runs |
 | `edit` / `write` anywhere else, or to a dot path (`.git`, `.env`, `.pi`, `.github`, ...) as named or where a symlink leads | Reviewed |
@@ -59,6 +59,26 @@ Reviews run at reasoning effort `high`, whatever thinking level the session uses
 The model can be any model in pi's `models.json`. Only the user-level `settings.json` counts, so a project's `.pi/settings.json` cannot change the reviewer. Some models behind OpenAI-compatible gateways ignore a system prompt sent in the `developer` role, so every review fails; give those `"compat": { "supportsDeveloperRole": false }` in `models.json`.
 
 `autoReview.effort` sets the effort (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) when the model setting names none.
+
+### Read-only tools
+
+A tool whose server annotates it `readOnlyHint` runs without review. Some do not pass that on: T3 Code's pi bridge drops it, so its status checks and lists (`t3_thread_wait`, `t3_worktree_status`, ...) are reviewed, each costing a review's wait. Name such tools in `autoReview.readOnlyTools`, and they run like `read`:
+
+```json
+{
+  "autoReview": {
+    "readOnlyTools": [
+      "mcp__t3-code__t3_thread_wait",
+      "mcp__t3-code__t3_thread_list",
+      "mcp__t3-code__t3_worktree_status",
+      "mcp__t3-code__t3_worktree_list",
+      "mcp__t3-code__t3_pending_request_list"
+    ]
+  }
+}
+```
+
+These are among the tools T3 Code's server declares read-only. Name only tools that cannot change anything or send data out: a web search sends its terms to the search provider, so it stays reviewed. `mcp__t3-code__task_status` is not declared read-only, since reading a finished task's result marks its delivery to this thread as done; nothing leaves T3 Code, so you can add it if a review on every check costs you more than that. As with every other setting here, only the user-level `settings.json` counts.
 
 ### Triage model (experimental, off by default)
 
@@ -150,6 +170,7 @@ T3 Code starts pi in **Auto** as it does in Supervised, so pi-auto-review review
 - If the extension fails to load, nothing is reviewed (in T3 Code outside Full access, the bridge then asks about every call).
 - An `edit` or `write` through a symlink that leads nowhere, or to a file with hard links (as pnpm's `node_modules` has), is blocked, since it could land in pi-auto-review's folder; the agent is told it is a call on its own files.
 - For commands, the check for pi-auto-review's own files is lexical: a command that reaches its folder through a relative path or a variable goes to the reviewer like any other call.
+- `autoReview.readOnlyTools` trusts names: another extension's tool registered under one of them runs unreviewed, whatever it does. A call by one of them that names pi-auto-review's folder is still blocked.
 - `codemode` is trusted by name to be pi's sandbox: its own `models.*` calls (classifiers, image generation) reach the providers in `models.json` without review, though every tool it calls is checked.
 - A compaction note, or a task for a pi subagent outside Full access, that names pi-auto-review's folder goes to the reviewer, not blocked; the subagent's own calls on the folder are blocked. A delegation is taken to be for pi only when it names no provider (`target.providerInstanceId`, `target.driverKind`), so a task for this same pi instance named explicitly is blocked. `compact_context` is trusted by its name: another extension's tool of that name that does more than summarize goes to the reviewer, not blocked, when it names the folder. Other tools that only pass text to an agent (`t3_thread_send`, ...) are still blocked when they name the folder.
 - In T3 Code, pi-auto-review turns off the bridge's own prompts by unsetting `T3_PI_RUNTIME_MODE`, which the bridge reads as Full access, and sets it back when the session ends or reloads. If a T3 Code release stops rereading it on every call, you get the bridge's prompts as well as these.
