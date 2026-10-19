@@ -407,6 +407,7 @@ function textForCheckedAgent(toolName: string, input: Record<string, unknown>): 
 export function readOnly(toolName: string, tool: { annotations?: { readOnlyHint?: boolean }; sourceInfo?: { path?: string } } | undefined, own?: Settings): boolean {
 	if (tool?.annotations?.readOnlyHint === true) return true;
 	// An extension that replaces tool_search keeps the name, so only pi's own counts.
+	// ponytail: mirrors pi's path for its tool-search extension; if pi renames it, tool_search is reviewed again.
 	if (toolName === "tool_search" && tool?.sourceInfo?.path === "builtin:tool-search") return true;
 	try {
 		const names = (own ?? settings()).readOnlyTools;
