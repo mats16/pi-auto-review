@@ -91,8 +91,9 @@ A triage model is a classifier, such as TypeSafe's Jev, that answers in a fracti
     "effort": "high",
     "triage": {
       "enabled": true,
-      "model": "databricks-oss/system.ai.openjev-qwen35-4b",
+      "model": "system.ai.openjev-qwen35-4b",
       "endpoint": "https://<workspace>.cloud.databricks.com/ai-gateway/typesafe/v1/systemone",
+      "apiKey": "!databricks auth token --profile <profile> | jq -r .access_token",
       "confidence": 0.75
     }
   }
@@ -102,8 +103,9 @@ A triage model is a classifier, such as TypeSafe's Jev, that answers in a fracti
 | Key | Meaning |
 |---|---|
 | `enabled` | `true` turns it on. Anything else, or no `triage` at all, leaves it off. |
-| `model` | `provider/model-id`. A System One classifier pi lists (`typesafe/jev-latest`, `openrouter/typesafe/jev-1.13`, ...) is called through pi. Other classifier APIs, such as llama.cpp's, are not supported: the questions are written for System One. |
-| `endpoint` | For a classifier pi does not list, such as Databricks' OpenJev: the full `https` URL of its System One API (plain `http` only for `localhost`, since the provider's credentials go with it), which gets the request as is, so a path that moves (Databricks' is in beta) needs only this setting changed. `model`'s provider then only picks whose credentials are sent, those of an existing provider in `models.json`; nothing needs adding there, and `models.json` cannot define classifiers anyway. |
+| `model` | The classifier's model ID, as its endpoint names it (`system.ai.openjev-qwen35-4b`, `jev-latest`, ...), with no provider: it is sent as is. |
+| `endpoint` | The full `https` URL of the classifier's System One API (plain `http` only for `localhost`, since the API key goes with it), which gets the request as is, so a path that moves (Databricks' is in beta) needs only this setting changed. Other classifier APIs, such as llama.cpp's, are not supported: the questions are written for System One. |
+| `apiKey` | Sent as `Authorization: Bearer <key>`. The key itself, or `!` and a shell command that prints it, such as a CLI that issues short-lived tokens. A command's output is kept for 5 minutes, and dropped early when the endpoint answers 401 or 403; a command that fails, prints nothing, or runs over 10 s is not kept, and the reviewer judges the call (the warning says only how the command ended, not its output, so run it in a shell to see why). Left out, no key is sent. `models.json`'s credentials are not used. |
 | `confidence` | How sure the triage model must be that the call is routine rather than the likeliest risky kind it sees (deleting, installing, posting, ...), from 0.7 to 1 (default `0.75`, routine three times as likely as that risk). Higher sends more calls to the reviewer. At 0.6 a call that should ask was cleared, and 0.7 keeps a margin over it, so a lower value, such as the 0.6 that used to be the default, is refused and the reviewer judges every call. |
 
 With Databricks' OpenJev (Qwen3.5 4B) in front of GLM-5.3-Flash at `high`, on the eval's synthesized patterns and history (2026-10-13), the triage model let no call through that should have asked, at any of these settings:
@@ -143,7 +145,7 @@ jq -s '[.[] | .reviewer.ms // empty] | sort | .[length/2|floor]' ~/.pi/agent/pi-
 
 ## Report a misjudgment
 
-When a verdict looks wrong, a call that ran but should have asked or one denied that should have run, run `/auto-review-report`. It lists the last 10 verdicts, asks what should have happened, shows you the whole draft, and opens it as a new [GitHub issue](https://github.com/mats16/pi-auto-review/issues) in your browser: nothing is sent until you submit it there. The draft holds the verdict and whether the triage model or the reviewer gave it, the settings it ran with (the reviewer's model and effort, and the triage model, its `confidence`, and whether a custom `endpoint` is set, not the URL), your note, the version, and the call as the agent wrote it, which can include secrets or private paths: remove those before you submit. Your messages are not included, so say in your note what you had asked for. Without the command, the [Misjudged call](https://github.com/mats16/pi-auto-review/issues/new?template=misjudgment.md) template asks for the same.
+When a verdict looks wrong, a call that ran but should have asked or one denied that should have run, run `/auto-review-report`. It lists the last 10 verdicts, asks what should have happened, shows you the whole draft, and opens it as a new [GitHub issue](https://github.com/mats16/pi-auto-review/issues) in your browser: nothing is sent until you submit it there. The draft holds the verdict and whether the triage model or the reviewer gave it, the settings it ran with (the reviewer's model and effort, and the triage model and its `confidence`, not its `endpoint` or `apiKey`), your note, the version, and the call as the agent wrote it, which can include secrets or private paths: remove those before you submit. Your messages are not included, so say in your note what you had asked for. Without the command, the [Misjudged call](https://github.com/mats16/pi-auto-review/issues/new?template=misjudgment.md) template asks for the same.
 
 ## T3 Code
 
@@ -181,6 +183,7 @@ T3 Code starts pi in **Auto** as it does in Supervised, so pi-auto-review review
 - The triage model reads the call's text, which the agent wrote, and small classifiers do not treat it as hostile: text in a call can talk it into rating the call routine, and the call then runs without the reviewer. It also sees only your messages and the call, not the agent's words or tool output, so it cannot tell when untrusted content steered the agent; the reviewer can. This is why it is off by default.
 - The triage model's questions were tuned on the eval's own cases, and the default `confidence` and the 0.2 for its two flags were chosen on its answers to those, the history, and cases written later; few of the calls that should ask came close. Its answers shift with the order of their options and the model's version. Rerun `npm run eval` when you change either.
 - The review log keeps each call as the agent wrote it, and the reviewer's reason, which can quote it, secrets included: delete `pi-auto-review.jsonl` and its `.1` to start over. Only you can read a file it creates. It keeps at most about 10 MB, so older reviews are lost; copy the `.1` away to keep them. If the file cannot be moved to `.1`, reviews stop being logged rather than letting it grow. The call, the reason, and errors keep their first 500 characters, and a line still over 16,000 characters, such as one with a custom triage endpoint's oversized answers, keeps only the verdict. Two pi processes rotating it at the same moment can replace the full `.1` with a nearly empty one. A failed write is skipped without notice.
+- The triage model's `apiKey` takes the key itself or a `!` command, not pi's `$NAME` environment variables. A command's key is reused for 5 minutes whatever its expiry, so a token that lasts less (and is not rejected with a 401 or 403) fails triage calls until then; the reviewer judges them. The first call after the 5 minutes waits for the command.
 - Databricks limits OpenJev's input tokens per minute for a workspace. Over the limit, the reviewer judges the calls, so reviews slow down but do not fail.
 
 ## Development

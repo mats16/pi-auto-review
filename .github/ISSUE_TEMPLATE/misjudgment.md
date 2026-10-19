@@ -15,7 +15,7 @@ labels: misjudgment
 
 - model: <!-- the reviewer, as provider/model-id -->
 - effort: <!-- high unless you set another -->
-- triage: <!-- off, or its model and confidence, and whether a custom endpoint is set (not the URL) -->
+- triage: <!-- off, or its model and confidence (not its endpoint or API key) -->
 
 ### What it should have done
 
