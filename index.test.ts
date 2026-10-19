@@ -65,7 +65,7 @@ test("needsReview follows links as pi's file tools resolve paths, so a link in /
 		assert.equal(needsReview("write", { path: join(scratch, "hard") }, project), true);
 		writeFileSync(join(scratch, "file"), "");
 		assert.equal(needsReview("write", { path: join(scratch, "file", "x") }, project), true);
-		// The same links into the extension's folder go to a human, as a write there would, and so does a write whose place
+		// The same links into the extension's folder are blocked, as a write there would be, and so is a write whose place
 		// cannot be told: it could land there.
 		assert.equal(touches(dirname(outside), "write", { path: join(scratch, "link") }, project), true);
 		assert.equal(touches(dirname(outside), "write", { path: join(scratch, "l\u3000") }, project), true);
@@ -197,7 +197,7 @@ test("touches catches calls on the extension's own files", () => {
 	assert.equal(touches(self, "mcp__t3-code__delegate_task", { task }, cwd), false);
 	assert.equal(touches(self, "mcp__t3-code__delegate_task", { task, target: { model: "m", providerInstanceId: null }, runtimeMode: "inherit" }, cwd), false);
 	assert.equal(touches(self, "compact_context", { instructions: "Read ~/ext/pi-auto-review only with the read tool." }, cwd), false);
-	// Another provider's subagent, or one in Full access, is not checked by this extension, so a human decides.
+	// Another provider's subagent, or one in Full access, is not checked by this extension, so the call is blocked.
 	assert.equal(touches(self, "mcp__t3-code__delegate_task", { task, target: { providerInstanceId: "codex" } }, cwd), true);
 	assert.equal(touches(self, "mcp__t3-code__delegate_task", { task, target: { driverKind: "claudeAgent" } }, cwd), true);
 	assert.equal(touches(self, "mcp__t3-code__delegate_task", { task, runtimeMode: "full-access" }, cwd), true);
@@ -606,42 +606,34 @@ test("a review that did not happen blocks the call, and says it is not a judgmen
 	assert.match(reason, /could not review bash.*review failure, not a determination/);
 });
 
-test("calls on the extension's own files skip the reviewer and go to a human, shown whole, or are blocked without a UI", async () => {
-	const long = await runCall("approval-required", { outcome: "allow" }, `printf '${"x".repeat(5_000)}' > ${import.meta.dirname}/index.ts; echo tail`);
-	assert.deepEqual([long.blocked, long.seen], [true, ["confirm"]]);
-	assert.match(confirmed!.at(-1)!, /echo tail/);
+test("calls on the extension's own files skip the reviewer and are blocked without asking, with a pointer to the read tools", async () => {
 	const command = `cat ${import.meta.dirname}/index.ts`;
-	const asked = await runCall("approval-required", { outcome: "allow" }, command);
-	assert.deepEqual([asked.blocked, asked.seen], [true, ["confirm"]]);
-	// The user sees which folder matched, and declining sends the agent to the tools that read it without asking.
-	assert.ok(confirmed!.at(-1)!.includes(`own files (${import.meta.dirname.replace(homedir(), "~")})`));
-	// The hint comes after the warning against retrying, so it reads as the route that stays open.
-	assert.match(asked.reason, /Do not retry it in another form.* use read, grep, find, or ls instead/);
-	const handlers = load(undefined);
-	const seen: string[] = [];
-	assert.equal(await handlers.tool_call({ toolName: "bash", input: { command } }, fakeCtx("", seen, true, true)), undefined);
-	assert.deepEqual(seen, ["confirm"]);
-	const headless = await runCall(undefined, { outcome: "allow" }, command, false);
-	assert.deepEqual([headless.blocked, headless.seen], [true, []]);
-	assert.match(headless.reason, /interactive session/);
-	// An edit or write cannot be done by reading, so it gets no hint to read instead.
+	for (const hasUI of [true, false]) {
+		const { blocked, reason, seen } = await runCall("approval-required", { outcome: "allow" }, command, hasUI);
+		assert.deepEqual([blocked, seen], [true, []]);
+		// The agent sees which folder matched, and reads it with the tools that run without asking.
+		assert.ok(reason.includes(`own files (${import.meta.dirname.replace(homedir(), "~")})`));
+		// The pointer comes after the warning against retrying, so it reads as the route that stays open.
+		assert.match(reason, /Do not retry it in another form.* use read, grep, find, or ls instead.*tell the user/);
+	}
+	// An edit or write cannot be done by reading, so it gets no pointer to read instead.
 	const editSeen: string[] = [];
-	const edit = await load(undefined).tool_call({ toolName: "edit", input: { path: `${import.meta.dirname}/index.ts` } }, fakeCtx("", editSeen, false));
+	const edit = await load(undefined).tool_call({ toolName: "edit", input: { path: `${import.meta.dirname}/index.ts` } }, fakeCtx("", editSeen));
 	assert.deepEqual([edit?.block, editSeen], [true, []]);
-	assert.match(String(edit?.reason), /own files \(.*interactive session/);
+	assert.match(String(edit?.reason), /own files \(/);
 	assert.doesNotMatch(String(edit?.reason), /use read/);
 });
 
-test("a task for a pi subagent that names the extension's folder goes to the reviewer; one for another provider goes to a human", async () => {
+test("a task for a pi subagent that names the extension's folder goes to the reviewer; one for another provider is blocked", async () => {
 	const task = `Read ${import.meta.dirname}/README.md and list what the slides miss.`;
 	const call = async (input: object) => {
 		const seen: string[] = [];
-		await load("approval-required").tool_call({ toolName: "mcp__t3-code__delegate_task", input }, fakeCtx('{"outcome":"allow"}', seen));
-		return seen;
+		const result = await load("approval-required").tool_call({ toolName: "mcp__t3-code__delegate_task", input }, fakeCtx('{"outcome":"allow"}', seen));
+		return [result?.block === true, seen];
 	};
-	assert.deepEqual(await call({ task, mode: "async" }), ["review:high"]);
-	assert.deepEqual(await call({ task, target: { providerInstanceId: "codex" } }), ["confirm"]);
-	assert.deepEqual(await call({ task, runtimeMode: "full-access" }), ["confirm"]);
+	assert.deepEqual(await call({ task, mode: "async" }), [false, ["review:high"]]);
+	assert.deepEqual(await call({ task, target: { providerInstanceId: "codex" } }), [true, []]);
+	assert.deepEqual(await call({ task, runtimeMode: "full-access" }), [true, []]);
 });
 
 test("a call too large for the reviewer to see whole goes to the user, never to the reviewer", async () => {
@@ -682,15 +674,17 @@ test("three denials in a row, or ten of the last fifty reviews, stop the run, as
 	assert.match(notified!.at(-1)!, /after 10 denials in the last 19 reviews\./); // the rule that fired
 });
 
-test("after any block, by a review or by the user, the rest of the run goes to the reviewer, so a workaround cannot pass through triage", async () => {
+test("after any block, by a review, by the user, or on the extension's own files, the rest of the run goes to the reviewer, so a workaround cannot pass through triage", async () => {
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { triage: { enabled: true, model: "typesafe/jev-latest" } } }));
 	try {
-		// A reviewer that denies, one whose review fails, and the user declining a call too large to review.
+		// A reviewer that denies, one whose review fails, the user declining a call too large to review, and a call on the
+		// extension's own files.
 		const oversize = `printf '${"x".repeat(MAX_CALL_FOR_TEST)}'`;
 		for (const [reviewer, blockedCall] of [
 			['{"risk_level":"high","outcome":"deny","rationale":"r"}', "git push origin master"],
 			["no verdict here", "git push origin master"],
 			['{"outcome":"allow"}', oversize],
+			['{"outcome":"allow"}', `cat ${import.meta.dirname}/index.ts`],
 		]) {
 			const handlers = load(undefined);
 			const run = async (command: string) => {
