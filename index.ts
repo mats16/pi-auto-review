@@ -7,11 +7,13 @@
  * Every other call (bash, edits elsewhere, MCP and custom tools) goes to a reviewer model first, with the session's
  * transcript: the user's messages are trusted, the rest is untrusted evidence. As in Codex, the reviewer rates the
  * call's risk and the user's authorization for it, and decides: low and medium run, high runs only with the user's
- * authorization, critical never does. A denied call, or one whose review failed, is blocked and the agent is told why,
- * so it takes a safer route or asks the user; the user's explicit approval in chat lets the next review allow it,
- * unless it is critical. /auto-review approves one retry of a recent denial, as in Codex: the agent is told, and the
- * retry is still reviewed, with that approval as trusted evidence. Three denials in a row, or ten in the last fifty
- * reviews within one run, stop that run.
+ * authorization, critical never does. As in Codex, a review that fails for a passing reason (a rate limit, an overloaded
+ * or failing server, a dropped connection or a request timeout, an unreadable answer) is tried again, up to three tries
+ * in all within its one 90-second deadline; any other failure, the deadline, or the session's abort ends it. A denied
+ * call, or one whose review failed, is blocked and the agent is told why, so it takes a safer route or asks the user;
+ * the user's explicit approval in chat lets the next review allow it, unless it is critical. /auto-review approves one
+ * retry of a recent denial, as in Codex: the agent is told, and the retry is still reviewed, with that approval as
+ * trusted evidence. Three denials in a row, or ten in the last fifty reviews within one run, stop that run.
  * Calls on this extension's own files skip the reviewer and are blocked without asking. Edits and writes are judged by
  * the name written and where its links lead, and one whose place cannot be told (a link that leads nowhere, a hard
  * link) is blocked too. A compaction note, or a task for a pi subagent outside Full access, that names its folder is
@@ -32,7 +34,8 @@
  * default. It is called at autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with
  * models.json's credentials: the key itself, or "!" and a command that prints it, whose output is kept five minutes.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
- * the call, the verdict, who decided it, and the triage model's answers and tokens and the reviewer's time and tokens.
+ * the call, the verdict, who decided it, and the triage model's answers and tokens and the reviewer's time, tries, and
+ * tokens.
  * A block on its own files and a call too large to review get a line of the same shape, decided by the rule or the user;
  * the calls a rule let run are only counted, by tool and rule, in one line per run; and a session T3 Code runs unreviewed
  * gets one line naming its mode. Past 5 MB it moves to pi-auto-review.jsonl.1, replacing the one before; if it cannot be
@@ -46,6 +49,7 @@ import { exec } from "node:child_process";
 import { appendFileSync, lstatSync, readFileSync, realpathSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Message } from "@earendil-works/pi-ai";
@@ -71,6 +75,8 @@ const TMP_DIRS = process.platform === "win32" ? [] : ["/tmp", "/private/tmp"];
 // providers unreviewed.
 const SCRIPT_TOOLS = new Set(["codemode"]);
 const TIMEOUT_MS = 90_000;
+// As in Codex: tries of one review within TIMEOUT_MS, the retries for a transient failure included.
+const MAX_REVIEW_ATTEMPTS = 3;
 const REASONING = "high";
 const LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 const TRIAGE_TIMEOUT_MS = 10_000;
@@ -876,7 +882,48 @@ function append(line: string) {
 	} catch {}
 }
 
-/** One review by the reviewer model. `record` gets its time and token usage, for autoReview.log. */
+/**
+ * Whether a failed review is worth another try, as Codex's guardian has it: rate limits, overload, 5xx, 408, 429, and a
+ * dropped connection or stream, timeouts included. A context window too small, a bad request, a rejected key, a safety
+ * filter, or a spent quota fails the same way again, so it is not retried, and neither is anything unrecognized.
+ */
+// ponytail: from the error's text, as pi-ai hands the reviewer's errors over only as text, with the wording pi-ai's own
+// retry classifier matches; a provider whose wording fits neither list is not retried.
+export function transient(message: string): boolean {
+	if (/context.?(window|length|size)|too long|too large|token limit|bad request|invalid.?(request|argument|param|model|value)|unauthori[sz]ed|forbidden|authenticat|api.?key|permission|(?<![\d,.])(400|401|403|404|413|422)(?!\d|,\d)|(content|usage).?polic|safety|content.?filter|moderation|flagged|quota|billing|insufficient.?(funds|balance|credit)|usage.?limit|budget|credit/i.test(message)) return false;
+	return /rate.?limit|too many requests|overloaded|capacity|high demand|unavailable|server.{0,12}error|internal.?error|gateway|(?<![\d,.])(408|429|5\d\d)(?!\d|,\d)|timed? ?out|timeout|deadline|connect|network|socket|fetch failed|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|other side closed|terminated|stream|premature|reset|disconnect|tr(y|ying) again|retry your request|try your request again|provider.?returned.?error|resource.?exhausted/i.test(message);
+}
+
+/** Milliseconds in a unit as an error writes it: "ms", "milliseconds", "s", "sec", "m", "minutes", "h", "days"; none is seconds. */
+function unitMs(unit: string): number {
+	const u = unit.toLowerCase();
+	if (/^(ms|milli)/.test(u)) return 1;
+	if (u.startsWith("h")) return 3_600_000;
+	if (u.startsWith("m")) return 60_000;
+	if (u.startsWith("d")) return 86_400_000;
+	return 1000;
+}
+
+/**
+ * How long to wait before attempt `attempt + 1`, as Codex does: 200 ms doubled each time, give or take 10%, and never
+ * sooner than the server asked.
+ */
+// ponytail: the server's wait is read from the error's text (pi-ai keeps the retry-after header to itself), so one it
+// sent only as a header is not honored.
+export function retryDelay(attempt: number, message: string): number {
+	// The duration after "retry after", "try again in", or "retry in", or before pi-ai's "retry delay", read whole and in
+	// any unit it is written in ("2", "1.5s", "500 milliseconds", "2h29m54s"); a bare number is seconds.
+	const [, after, requested] = message.match(/(?:retry[- ]after|(?:try again|retry) in)\W{0,3}(\d[\d.]*\s*[a-z]*(?:\s*\d[\d.]*\s*[a-z]*)*)|requested (\d[\d.]*\s*[a-z]*) retry delay/i) ?? [];
+	let server = 0;
+	for (const [, value, unit] of (after ?? requested ?? "").matchAll(/(\d+(?:\.\d+)?)\s*([a-z]*)/gi)) server += Number(value) * unitMs(unit);
+	return Math.max(200 * 2 ** (attempt - 1) * (0.9 + Math.random() * 0.2), server);
+}
+
+/**
+ * One review by the reviewer model, in up to MAX_REVIEW_ATTEMPTS tries within one TIMEOUT_MS deadline, as in Codex: a
+ * transient failure is tried again while the deadline leaves room for the wait, and anything else, or the session's
+ * abort, ends it. `record` gets its time, attempts, the failures retried, and token usage, for autoReview.log.
+ */
 async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionContext["model"]>, reasoning: string, lines: string[], toolName: string, input: unknown, record: Record<string, unknown>): Promise<Verdict> {
 	const prompt = [
 		`Working directory: ${ctx.cwd}`,
@@ -892,6 +939,41 @@ async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionCon
 	const timeout = AbortSignal.timeout(TIMEOUT_MS);
 	const signal = ctx.signal ? AbortSignal.any([timeout, ctx.signal]) : timeout;
 	const sent = Date.now();
+	const retried: string[] = [];
+	let attempts = 0;
+	try {
+		for (;;) {
+			attempts++;
+			const verdict = await reviewOnce(ctx, model, reasoning, prompt, signal, record);
+			if (verdict.risk !== "unknown") return verdict;
+			const failure = verdict.reason;
+			if (timeout.aborted) return unreviewed(`Review failed: timed out (${TIMEOUT_MS / 1000} s, ${attempts} ${attempts === 1 ? "attempt" : "attempts"})`);
+			// Unreadable answers are retried as Codex retries a parse failure; an abort never is. Their text is the
+			// reviewer's, not the server's, so it sets no wait.
+			const unreadable = failure.startsWith("Unreadable review");
+			const wait = retryDelay(attempts, unreadable ? "" : failure);
+			const again = !signal.aborted && (unreadable || transient(failure));
+			if (!again || attempts >= MAX_REVIEW_ATTEMPTS || Date.now() + wait >= sent + TIMEOUT_MS) {
+				return attempts === 1 ? verdict : unreviewed(`${failure} (${attempts} attempts)`);
+			}
+			retried.push(clip(failure, MAX_LOG_FIELD_CHARS));
+			try {
+				await sleep(wait, undefined, { signal });
+			} catch {
+				return unreviewed(ctx.signal?.aborted ? "Review failed: aborted" : `${failure} (${attempts} attempts)`);
+			}
+		}
+	} finally {
+		record.ms = Date.now() - sent;
+		record.attempts = attempts;
+		if (retried.length > 0) record.retried = retried;
+	}
+}
+
+/** One request to the reviewer: its verdict, or a failure (risk "unknown") saying why. */
+async function reviewOnce(ctx: ExtensionContext, model: NonNullable<ExtensionContext["model"]>, reasoning: string, prompt: string, signal: AbortSignal, record: Record<string, unknown>): Promise<Verdict> {
+	// An earlier try's tokens must not pass as this one's when this one fails before any.
+	delete record.usage;
 	try {
 		// Pin the effort: left unset, each provider picks its own, and some GPT models then do no reasoning at all.
 		const response = await ctx.modelRegistry
@@ -906,6 +988,7 @@ async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionCon
 				},
 			)
 			.result();
+		// ponytail: the last attempt's tokens only, so a retried unreadable answer's cost goes unlogged.
 		record.usage = response.usage;
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
 			return unreviewed(`Review failed: ${response.errorMessage ?? response.stopReason}`);
@@ -914,8 +997,6 @@ async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionCon
 		return parseVerdict(text) ?? unreviewed(`Unreadable review: ${clip(text, 200)}`);
 	} catch (error) {
 		return unreviewed(`Review failed: ${error instanceof Error ? error.message : String(error)}`);
-	} finally {
-		record.ms = Date.now() - sent;
 	}
 }
 
