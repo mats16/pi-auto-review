@@ -8,12 +8,12 @@
  * transcript: the user's messages are trusted, the rest is untrusted evidence. As in Codex, the reviewer rates the
  * call's risk and the user's authorization for it, and decides: low and medium run, high runs only with the user's
  * authorization, critical never does. As in Codex, a review that fails for a passing reason (a rate limit, an overloaded
- * or failing server, a dropped connection or a request timeout, an unreadable answer) is tried again, up to three times
- * within its one 90-second deadline; any other failure, the deadline, or the session's abort ends it. A denied call, or
- * one whose review failed, is blocked and the agent is told why, so it takes a safer route or asks the user; the user's
- * explicit approval in chat lets the next review allow it, unless it is critical. /auto-review approves one retry of a
- * recent denial, as in Codex: the agent is told, and the retry is still reviewed, with that approval as trusted
- * evidence. Three denials in a row, or ten in the last fifty reviews within one run, stop that run.
+ * or failing server, a dropped connection or a request timeout, an unreadable answer) is tried again, up to three tries
+ * in all within its one 90-second deadline; any other failure, the deadline, or the session's abort ends it. A denied
+ * call, or one whose review failed, is blocked and the agent is told why, so it takes a safer route or asks the user;
+ * the user's explicit approval in chat lets the next review allow it, unless it is critical. /auto-review approves one
+ * retry of a recent denial, as in Codex: the agent is told, and the retry is still reviewed, with that approval as
+ * trusted evidence. Three denials in a row, or ten in the last fifty reviews within one run, stop that run.
  * Calls on this extension's own files skip the reviewer and are blocked without asking. Edits and writes are judged by
  * the name written and where its links lead, and one whose place cannot be told (a link that leads nowhere, a hard
  * link) is blocked too. A compaction note, or a task for a pi subagent outside Full access, that names its folder is
@@ -887,11 +887,21 @@ function append(line: string) {
  * dropped connection or stream, timeouts included. A context window too small, a bad request, a rejected key, a safety
  * filter, or a spent quota fails the same way again, so it is not retried, and neither is anything unrecognized.
  */
-// ponytail: from the error's text, as pi-ai hands the reviewer's errors over only as text; a provider whose wording
-// fits neither list is not retried.
+// ponytail: from the error's text, as pi-ai hands the reviewer's errors over only as text, with the wording pi-ai's own
+// retry classifier matches; a provider whose wording fits neither list is not retried.
 export function transient(message: string): boolean {
-	if (/context.?(window|length|size)|too long|too large|token limit|bad request|invalid|unauthori[sz]ed|forbidden|authenticat|api.?key|permission|\b(400|401|403|404|413|422)\b|policy|safety|filter|moderation|flagged|quota|billing|insufficient|usage.?limit|budget|credit/i.test(message)) return false;
-	return /rate.?limit|too many requests|overloaded|capacity|high demand|unavailable|server.?error|internal.?error|gateway|\b(408|429|5\d\d)\b|timed? ?out|timeout|deadline|connect|network|socket|fetch failed|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|other side closed|terminated|stream|premature|reset|disconnect|try again/i.test(message);
+	if (/context.?(window|length|size)|too long|too large|token limit|bad request|invalid.?(request|argument|param|model|value)|unauthori[sz]ed|forbidden|authenticat|api.?key|permission|(?<![\d,.])(400|401|403|404|413|422)(?!\d|,\d)|(content|usage).?polic|safety|content.?filter|moderation|flagged|quota|billing|insufficient.?(funds|balance|credit)|usage.?limit|budget|credit/i.test(message)) return false;
+	return /rate.?limit|too many requests|overloaded|capacity|high demand|unavailable|server.{0,12}error|internal.?error|gateway|(?<![\d,.])(408|429|5\d\d)(?!\d|,\d)|timed? ?out|timeout|deadline|connect|network|socket|fetch failed|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|other side closed|terminated|stream|premature|reset|disconnect|tr(y|ying) again|retry your request|try your request again|provider.?returned.?error|resource.?exhausted/i.test(message);
+}
+
+/** Milliseconds in a unit as an error writes it: "ms", "milliseconds", "s", "sec", "m", "minutes", "h", "days"; none is seconds. */
+function unitMs(unit: string): number {
+	const u = unit.toLowerCase();
+	if (/^(ms|milli)/.test(u)) return 1;
+	if (u.startsWith("h")) return 3_600_000;
+	if (u.startsWith("m")) return 60_000;
+	if (u.startsWith("d")) return 86_400_000;
+	return 1000;
 }
 
 /**
@@ -901,8 +911,11 @@ export function transient(message: string): boolean {
 // ponytail: the server's wait is read from the error's text (pi-ai keeps the retry-after header to itself), so one it
 // sent only as a header is not honored.
 export function retryDelay(attempt: number, message: string): number {
-	const [, value, ms] = message.match(/(?:retry[- ]after\D{0,3}|(?:try again|retry) in |requested )(\d+(?:\.\d+)?)\s*(ms)?/i) ?? [];
-	const server = value === undefined ? 0 : Number(value) * (ms ? 1 : 1000);
+	// The duration after "retry after", "try again in", or "retry in", or before pi-ai's "retry delay", read whole and in
+	// any unit it is written in ("2", "1.5s", "500 milliseconds", "2h29m54s"); a bare number is seconds.
+	const [, after, requested] = message.match(/(?:retry[- ]after|(?:try again|retry) in)\W{0,3}(\d[\d.]*\s*[a-z]*(?:\s*\d[\d.]*\s*[a-z]*)*)|requested (\d[\d.]*\s*[a-z]*) retry delay/i) ?? [];
+	let server = 0;
+	for (const [, value, unit] of (after ?? requested ?? "").matchAll(/(\d+(?:\.\d+)?)\s*([a-z]*)/gi)) server += Number(value) * unitMs(unit);
 	return Math.max(200 * 2 ** (attempt - 1) * (0.9 + Math.random() * 0.2), server);
 }
 
@@ -935,9 +948,11 @@ async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionCon
 			if (verdict.risk !== "unknown") return verdict;
 			const failure = verdict.reason;
 			if (timeout.aborted) return unreviewed(`Review failed: timed out (${TIMEOUT_MS / 1000} s, ${attempts} ${attempts === 1 ? "attempt" : "attempts"})`);
-			const wait = retryDelay(attempts, failure);
-			// Unreadable answers are retried as Codex retries a parse failure; an abort never is.
-			const again = !signal.aborted && (failure.startsWith("Unreadable review") || transient(failure));
+			// Unreadable answers are retried as Codex retries a parse failure; an abort never is. Their text is the
+			// reviewer's, not the server's, so it sets no wait.
+			const unreadable = failure.startsWith("Unreadable review");
+			const wait = retryDelay(attempts, unreadable ? "" : failure);
+			const again = !signal.aborted && (unreadable || transient(failure));
 			if (!again || attempts >= MAX_REVIEW_ATTEMPTS || Date.now() + wait >= sent + TIMEOUT_MS) {
 				return attempts === 1 ? verdict : unreviewed(`${failure} (${attempts} attempts)`);
 			}
@@ -957,6 +972,8 @@ async function reviewWith(ctx: ExtensionContext, model: NonNullable<ExtensionCon
 
 /** One request to the reviewer: its verdict, or a failure (risk "unknown") saying why. */
 async function reviewOnce(ctx: ExtensionContext, model: NonNullable<ExtensionContext["model"]>, reasoning: string, prompt: string, signal: AbortSignal, record: Record<string, unknown>): Promise<Verdict> {
+	// An earlier try's tokens must not pass as this one's when this one fails before any.
+	delete record.usage;
 	try {
 		// Pin the effort: left unset, each provider picks its own, and some GPT models then do no reasoning at all.
 		const response = await ctx.modelRegistry
