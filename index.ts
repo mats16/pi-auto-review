@@ -26,13 +26,16 @@
  * The reviewer is PI_AUTO_REVIEW_MODEL, else autoReview.model in pi's user settings.json, else the session's model, run
  * at reasoning effort high unless the one named, or autoReview.effort, gives another. Through OpenAI's Responses API,
  * its answer is held to the verdict's JSON schema; other APIs answer in plain text.
- * With autoReview.triage turned on, a classifier (the triage model, such as TypeSafe's Jev) sees the user's
- * messages and the call first: a call it finds routine with a probability of at least 0.6, and routine rather than its
- * likeliest risk (probability its answer leaves out counts as one) with enough confidence, runs without the reviewer, and
- * anything else, or its failure, goes to the reviewer. It can only let a call run, never block one, and after any call
- * is blocked, the rest of that run goes to the reviewer alone, as does any call over 32,000 characters. It is off by
- * default. It is called at autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with
- * models.json's credentials: the key itself, or "!" and a command that prints it, whose output is kept five minutes.
+ * With autoReview.triage turned on, a classifier (the triage model, such as TypeSafe's Jev) sees the user's messages
+ * and the call first, for pi's bash, powershell, edit, and write, and the MCP and extension tools named in
+ * autoReview.triage.tools; any other tool goes to the reviewer, as Codex leaves MCP calls to its reviewer by default.
+ * Whether the call writes a rule to skip asking is asked in a request of its own, about the call alone. A call it finds
+ * routine with a probability of at least 0.6, and routine rather than its likeliest risk (probability its answer leaves
+ * out counts as one) with enough confidence, runs without the reviewer, and anything else, or its failure, goes to the
+ * reviewer. It can only let a call run, never block one, and after any call is blocked, the rest of that run goes to
+ * the reviewer alone, as does any call over 32,000 characters. It is off by default. It is called at
+ * autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with models.json's credentials: the
+ * key itself, or "!" and a command that prints it, whose output is kept five minutes.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
  * the call, the verdict, who decided it, and the triage model's answers and tokens and the reviewer's time, tries, and
  * tokens.
@@ -92,11 +95,19 @@ const TRIAGE_MIN_CONFIDENCE = 0.7;
 // adds up to at most 0.4, as under the old rule's default. Measured as above, it costs one history review in 78.
 const TRIAGE_ROUTINE = 0.6;
 // At or above this, the triage model's has_secret or loosens answer leaves the call to the reviewer. Measured as above:
-// 99% of the calls that should run were under 0.21 and 0.25, and the calls with a secret or a loosened rule were at
-// least 0.35 and 0.41; 0.3 left the lowest of those 0.2 logit from clearing.
+// 99% of the calls that should run were under 0.21 for has_secret, and the calls with a secret were at least 0.35; 0.3
+// left the lowest of those 0.2 logit from clearing. loosens, asked about the call alone (2026-10-22, the eval's cases
+// with six from sessions that had raised it): 99% of the calls that should run under 0.16, the calls that write a rule
+// to skip asking at least 0.62, 1.9 logit above this.
 const TRIAGE_FLAG = 0.2;
 /** The kinds of call the triage model may let run: as POLICY has it, routine work. */
 const ROUTINE_KINDS = ["read", "edit", "connected"];
+/**
+ * pi's tools the triage model judges. MCP and extension tools go to the reviewer unless autoReview.triage.tools names
+ * them: their servers' hints are missing or the server's word, and the triage model rated a Slack post a search
+ * through a connected tool (docs/triage-scope.md).
+ */
+const TRIAGE_TOOLS = ["bash", "powershell", "edit", "write"];
 const MAX_CHARS = 4_000;
 // A call over this goes to the user. The reviewer sees it whole, so its context window must hold this, the transcript,
 // and POLICY; 128,000 characters fit with room in GLM-5.3-Flash's million tokens, and the eval checks that a risky
@@ -612,14 +623,16 @@ export function reviewer(ctx: ExtensionContext, own: Settings = settings()) {
 
 type Answers = Record<string, { choice?: string; probabilities?: Record<string, number>; probability?: number }>;
 type ClassifierContext = { state: object; questions: Record<string, { type: string }> };
-type Classify = (context: ClassifierContext, signal: AbortSignal) => Promise<{ answers: Answers; usage?: object }>;
+type Usage = { input?: number; output?: number };
+type Classify = (context: ClassifierContext, signal: AbortSignal) => Promise<{ answers: Answers; usage?: Usage }>;
 
 /**
  * The triage model from autoReview.triage, when "enabled" is true: a classifier that lets routine calls run without
  * the reviewer. It is called at "endpoint", the full URL of a System One API, as "model", with "apiKey" as its bearer
- * token. A setting that cannot be used is returned as an error, and the reviewer judges every call.
+ * token. It judges only the calls of its `tools`: TRIAGE_TOOLS and the names in "tools". A setting that cannot be used
+ * is returned as an error, and the reviewer judges every call.
  */
-export function triageModel(own: Settings = settings()): { spec: string; confidence: number; classify: Classify } | { error: string } | undefined {
+export function triageModel(own: Settings = settings()): { spec: string; confidence: number; tools: string[]; classify: Classify } | { error: string } | undefined {
 	const triage = own.triage;
 	if (triage?.enabled !== true) return undefined;
 	const spec = typeof triage.model === "string" ? triage.model : "";
@@ -638,7 +651,11 @@ export function triageModel(own: Settings = settings()): { spec: string; confide
 	if (keySetting !== undefined && (typeof keySetting !== "string" || keySetting.replace(/^!/, "").trim() === "")) {
 		return { error: "autoReview.triage.apiKey must be the key, or ! and a command that prints it." };
 	}
-	return { spec, confidence, classify: (context, signal) => systemOne(spec, String(endpoint), keySetting, context, signal) };
+	// ponytail: trusts names, as autoReview.readOnlyTools does, so another extension's tool registered under one goes to
+	// the triage model, which can let it run without the reviewer; unlike readOnlyTools, it does not run unchecked.
+	const named = triage.tools ?? [];
+	if (!Array.isArray(named) || !named.every((name) => typeof name === "string")) return { error: "autoReview.triage.tools must be a list of tool names." };
+	return { spec, confidence, tools: [...TRIAGE_TOOLS, ...named], classify: (context, signal) => systemOne(spec, String(endpoint), keySetting, context, signal) };
 }
 
 // ponytail: a fixed 5 minutes from the command's start, not the token's own expiry; a 401 or 403 drops it early, and a
@@ -682,7 +699,7 @@ function forget(setting: string, key: Promise<string>) {
  * One System One request, POSTed to the endpoint with the API key, in the body pi sends TypeSafe. Its token counts are
  * returned as pi names them; Databricks publishes no price for OpenJev, so there is no cost.
  */
-async function systemOne(model: string, endpoint: string, keySetting: string | undefined, context: ClassifierContext, signal: AbortSignal): Promise<{ answers: Answers; usage?: object }> {
+async function systemOne(model: string, endpoint: string, keySetting: string | undefined, context: ClassifierContext, signal: AbortSignal): Promise<{ answers: Answers; usage?: Usage }> {
 	const headers = new Headers({ "content-type": "application/json" });
 	const key = keySetting === undefined ? undefined : apiKey(keySetting);
 	if (key !== undefined) {
@@ -718,7 +735,8 @@ async function systemOne(model: string, endpoint: string, keySetting: string | u
 /**
  * What the triage model sees: the working directory, the user's messages and /auto-review approval (the trusted
  * entries of the transcript), and the call. Not POLICY, nor the agent's words or tool output: a small classifier
- * loses accuracy on context it does not need, and may follow instructions written there.
+ * loses accuracy on context it does not need, and may follow instructions written there. Its loosens question sees
+ * only the working directory and the call.
  */
 export function triageState(lines: string[], cwd: string, toolName: string, input: unknown) {
 	const entries = lines.map((line) => JSON.parse(line));
@@ -776,6 +794,10 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		if (!useTriage) skipped = "skipped after a block";
 		else if (plannedCall(toolName, input).length > TRIAGE_MAX_CALL_CHARS) skipped = "skipped for a large call";
 		triage = skipped === undefined ? triageModel(own) : undefined;
+		if (triage !== undefined && "tools" in triage && !triage.tools.includes(toolName)) {
+			skipped = "skipped for its tool";
+			triage = undefined;
+		}
 	} catch (error) {
 		return unreviewed(`Cannot read the reviewer from pi's settings.json: ${error instanceof Error ? error.message : error}`);
 	}
@@ -784,9 +806,10 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 	// The endpoint and API key stay out: a workspace URL can name the organization.
 	let triageSetup = "off";
 	if (own.triage?.enabled === true) {
-		const { model: triageSpec, confidence, endpoint } = own.triage;
+		const { model: triageSpec, confidence, endpoint, tools } = own.triage;
+		const named = Array.isArray(tools) && tools.length > 0 ? `, tools ${tools.join(" ")}` : "";
 		// Clipped and on one line, as written by hand it could be anything and would garble the report's list.
-		triageSetup = clip(`${String(triageSpec)}, confidence ${confidence ?? TRIAGE_CONFIDENCE}`.replace(/\s+/g, " "), 200);
+		triageSetup = clip(`${String(triageSpec)}, confidence ${confidence ?? TRIAGE_CONFIDENCE}${named}`.replace(/\s+/g, " "), 200);
 		// The error for a bad endpoint quotes it, so it is masked there too.
 		if (triage !== undefined && "error" in triage) triageSetup += ` (unusable: ${clip(endpoint === undefined ? triage.error : triage.error.replaceAll(JSON.stringify(endpoint), "<endpoint>"), 200)})`;
 		else if (skipped !== undefined) triageSetup += ` (${skipped})`;
@@ -810,10 +833,19 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		const timeout = AbortSignal.timeout(TRIAGE_TIMEOUT_MS);
 		const sent = Date.now();
 		try {
-			const { answers, usage } = await triage.classify(
-				{ state: triageState(lines, ctx.cwd, toolName, input), questions: TRIAGE_QUESTIONS },
-				ctx.signal ? AbortSignal.any([timeout, ctx.signal]) : timeout,
-			);
+			const signal = ctx.signal ? AbortSignal.any([timeout, ctx.signal]) : timeout;
+			const state = triageState(lines, ctx.cwd, toolName, input);
+			// loosens is asked about the call alone, in a request of its own: with the user's messages beside it, the
+			// triage model raised it on reads when the user had asked it not to ask them, and lowered it on a call that
+			// does write such a rule (docs/triage-scope.md).
+			const { loosens, ...questions } = TRIAGE_QUESTIONS;
+			const [main, flag] = await Promise.all([
+				triage.classify({ state, questions }, signal),
+				triage.classify({ state: { working_directory: state.working_directory, call: state.call }, questions: { loosens } }, signal),
+			]);
+			const answers = { ...main.answers, loosens: flag.answers.loosens };
+			// Both requests' tokens, when either reports them.
+			const usage = (main.usage ?? flag.usage) && { input: (main.usage?.input ?? 0) + (flag.usage?.input ?? 0), output: (main.usage?.output ?? 0) + (flag.usage?.output ?? 0) };
 			const cleared = routine(answers, triage.confidence);
 			record.triage = { model: triage.spec, ms: Date.now() - sent, routine: cleared, answers, usage };
 			if (cleared) {

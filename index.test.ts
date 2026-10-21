@@ -337,6 +337,11 @@ test("triageModel is off unless autoReview.triage.enabled is true, and reports a
 	assert.match(triageOf({ enabled: true, model: "jev-latest", endpoint, confidence: 0.6 }), /confidence must be a number from 0.7 to 1/);
 	assert.match(triageOf({ enabled: true, model: "jev-latest", endpoint, confidence: 1.1 }), /confidence must be/);
 	assert.match(triageOf({ enabled: true, model: "jev-latest", endpoint, confidence: "0.5" }), /confidence must be/);
+	// pi's shell and file tools, and the MCP and extension tools the user names.
+	const toolsOf = (tools?: unknown) => (triageModel({ triage: { enabled: true, model: "jev-latest", endpoint, tools } }) as { tools?: string[]; error?: string });
+	assert.deepEqual(toolsOf().tools, ["bash", "powershell", "edit", "write"]);
+	assert.deepEqual(toolsOf(["mcp__web_search__web_search"]).tools, ["bash", "powershell", "edit", "write", "mcp__web_search__web_search"]);
+	for (const tools of ["mcp__web_search__web_search", [7], { web_search: true }]) assert.match(toolsOf(tools).error!, /autoReview.triage.tools must be a list of tool names/);
 });
 
 test("apiKey is the setting as written, or what its ! command prints, kept five minutes; a failure is not kept", async () => {
@@ -381,15 +386,17 @@ test("triageState gives the triage model only the trusted entries and the call, 
 const MAX_CALL_FOR_TEST = 129_000; // over the 128,000-character limit, so the user is asked
 
 /** A session with the triage model turned on: its endpoint answers as given (or throws), and the reviewer allows. */
-async function triaged(classify: () => Promise<object>, triage: object = {}, signal?: AbortSignal, own: object = {}, command = "ls") {
+async function triaged(classify: () => Promise<object>, triage: object = {}, signal?: AbortSignal, own: object = {}, command: string | [string, unknown] = "ls") {
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { ...own, triage: { enabled: true, model: "jev-latest", endpoint: "https://gw.example/systemone", ...triage } } }));
 	const seen: string[] = [];
 	const ctx: any = fakeCtx('{"outcome":"allow"}', seen);
 	if (signal) ctx.signal = signal;
 	const realFetch = globalThis.fetch;
-	globalThis.fetch = (async () => (seen.push("triage"), new Response(JSON.stringify({ answers: await classify(), usage: { input_tokens: 50, output_tokens: 0 } })))) as any;
+	// Each review asks loosens in a request of its own; only the main one is counted.
+	globalThis.fetch = (async (_url: string, init: any) => ("kind" in JSON.parse(init.body).questions && seen.push("triage"), new Response(JSON.stringify({ answers: await classify(), usage: { input_tokens: 50, output_tokens: 0 } })))) as any;
 	try {
-		return { verdict: await review(ctx, "bash", { command }), seen, ctx };
+		const [toolName, input] = typeof command === "string" ? ["bash", { command }] : command;
+		return { verdict: await review(ctx, toolName, input), seen, ctx };
 	} finally {
 		globalThis.fetch = realFetch;
 		rmSync(join(agentDir, "settings.json"));
@@ -422,9 +429,44 @@ test("a routine call the triage model clears runs without the reviewer; anything
 		throw new Error("This operation was aborted");
 	}, {}, aborted.signal);
 	assert.deepEqual([stopped.verdict.risk, stopped.verdict.warning, stopped.seen], ["unknown", undefined, ["triage"]]);
+	// An MCP or extension tool goes to the reviewer unless named: the triage model rated a Slack post a connected-tool search.
+	const post: [string, unknown] = ["mcp__slack__slack_write_api_call", { endpoint: "chat.postMessage", params: { channel: "C0", text: "hi" } }];
+	const unnamed = await triaged(async () => answers({ connected: 0.9, others: 0.1 }), {}, undefined, {}, post);
+	assert.deepEqual([unnamed.seen, unnamed.verdict.setup?.triage], [["review:high"], "jev-latest, confidence 0.75 (skipped for its tool)"]);
+	const search: [string, unknown] = ["mcp__web_search__web_search", { query: "sqlite-vec" }];
+	const named = await triaged(async () => answers({ connected: 0.9, others: 0.1 }), { tools: ["mcp__web_search__web_search"] }, undefined, {}, search);
+	assert.deepEqual([named.seen, named.verdict.setup?.by], [["triage"], "triage"]);
+	assert.deepEqual((await triaged(async () => answers({ connected: 1 }), { tools: ["mcp__web_search__web_search"] }, undefined, {}, post)).seen, ["review:high"]);
+	assert.deepEqual((await triaged(async () => answers({ edit: 1 }), {}, undefined, {}, ["write", { path: "/etc/hosts", content: "" }])).seen, ["triage"]);
 	const off = await triaged(async () => answers({ read: 1 }), { endpoint: "" });
 	assert.deepEqual(off.seen, ["review:high"]);
 	assert.match(off.verdict.warning!, /triage model is off/);
+});
+
+test("loosens is read from its own request, about the call alone, so the user's own wording does not move it", async () => {
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { triage: { enabled: true, model: "jev-latest", endpoint: "https://gw.example/systemone" } } }));
+	const realFetch = globalThis.fetch;
+	const ask = async (main: number, own: number) => {
+		globalThis.fetch = (async (_url: string, init: any) => {
+			const alone = !("kind" in JSON.parse(init.body).questions);
+			return new Response(JSON.stringify({ answers: alone ? { loosens: { noul: own } } : answers({ read: 1 }, { loosens: main }) }));
+		}) as any;
+		const ctx: any = fakeCtx('{"outcome":"allow"}', []);
+		ctx.sessionManager.getBranch = () => [{ type: "message", message: { role: "user", content: "聞き返さずに進めてください。" } }];
+		return (await review(ctx, "bash", { command: "ls" })).setup?.by;
+	};
+	try {
+		assert.equal(await ask(0.7, 0.05), "triage"); // the main request's loosens is not used
+		assert.equal(await ask(0.05, 0.7), "reviewer");
+		// Either request failing is a triage failure: the reviewer judges the call.
+		globalThis.fetch = (async (_url: string, init: any) =>
+			"kind" in JSON.parse(init.body).questions ? new Response(JSON.stringify({ answers: answers({ read: 1 }) })) : new Response("overloaded", { status: 503 })) as any;
+		const failed = await review(fakeCtx('{"outcome":"allow"}', []) as any, "bash", { command: "ls" });
+		assert.deepEqual([failed.setup?.by, /System One returned 503/.test(failed.warning ?? "")], ["reviewer", true]);
+	} finally {
+		globalThis.fetch = realFetch;
+		rmSync(join(agentDir, "settings.json"));
+	}
 });
 
 test("each verdict carries the reviewer's model and effort and the triage settings it ran with, for /auto-review-report", async () => {
@@ -433,6 +475,9 @@ test("each verdict carries the reviewer's model and effort and the triage settin
 	// The endpoint and API key are left out, since a workspace URL can name the organization.
 	const custom = await triaged(async () => answers({ destroy: 1 }), { model: "openjev", endpoint: "https://acme.example/so", apiKey: "sk-secret", confidence: 0.8 });
 	assert.deepEqual([custom.verdict.setup?.triage, custom.verdict.setup?.by], ["openjev, confidence 0.8", "reviewer"]);
+	// The tools named for it, so a report on a call to one shows that the user let the triage model judge it.
+	const named = await triaged(async () => answers({ read: 1 }), { tools: ["mcp__web_search__web_search"] }, undefined, {}, ["mcp__web_search__web_search", { query: "q" }]);
+	assert.equal(named.verdict.setup?.triage, "jev-latest, confidence 0.75, tools mcp__web_search__web_search");
 	// Nor does the error for an endpoint it refuses, which quotes it.
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { triage: { enabled: true, model: "openjev", endpoint: "http://private-workspace.example/serving" } } }));
 	let refused;
@@ -470,7 +515,7 @@ test("autoReview.log appends each review to pi-auto-review.jsonl: who decided, t
 		assert.deepEqual([cleared.by, cleared.tool, cleared.call, cleared.outcome, cleared.triage.routine, cleared.reviewer], ["triage", "bash", "ls", "allow", true, undefined]);
 		assert.equal(cleared.triage.answers.kind.probabilities.read, 0.9);
 		assert.equal(typeof cleared.triage.ms, "number");
-		assert.deepEqual(cleared.triage.usage, { input: 50, output: 0 }); // under pi's names; Databricks publishes no price for OpenJev
+		assert.deepEqual(cleared.triage.usage, { input: 100, output: 0 }); // both requests, under pi's names; Databricks publishes no price for OpenJev
 		assert.deepEqual([reviewed.by, reviewed.triage.routine, reviewed.reviewer.effort, reviewed.reviewer.usage], ["reviewer", false, "high", { input: 10, output: 2 }]);
 		assert.equal(typeof reviewed.reviewer.ms, "number");
 		assert.deepEqual([failed.by, failed.triage.error], ["reviewer", "429"]); // the error itself, not the warning around it
@@ -509,6 +554,10 @@ test("autoReview.log appends each review to pi-auto-review.jsonl: who decided, t
 		await review(fakeCtx('{"outcome":"allow"}', []) as any, "bash", { command: "ls" }, { triage: false });
 		assert.deepEqual([JSON.parse(readFileSync(file, "utf8")).triage, JSON.parse(readFileSync(file, "utf8")).by], ["skipped after a block", "reviewer"]);
 		rmSync(file);
+		// And for a tool it does not judge.
+		await review(fakeCtx('{"outcome":"allow"}', []) as any, "mcp__slack__slack_write_api_call", { endpoint: "chat.postMessage" });
+		assert.deepEqual([JSON.parse(readFileSync(file, "utf8")).triage, JSON.parse(readFileSync(file, "utf8")).by], ["skipped for its tool", "reviewer"]);
+		rmSync(file);
 		// A log that cannot be written leaves the verdict as it was.
 		mkdirSync(file);
 		assert.equal((await review(fakeCtx('{"outcome":"allow"}', []) as any, "bash", { command: "ls" })).outcome, "allow");
@@ -545,8 +594,11 @@ test("the triage model is called at its endpoint, as is, as System One, with the
 		assert.equal(fetched[0].redirect, "error"); // a redirect must not carry the key past the https check
 		assert.equal(fetched[0].body.model, "openjev");
 		assert.deepEqual([fetched[0].body.questions.kind.type, fetched[0].body.questions.has_secret.type], ["choice", "noul"]); // the wire's name for bool
+		// loosens goes in a request of its own, about the call alone: the user's messages swayed it both ways.
+		assert.deepEqual([Object.keys(fetched[0].body.questions), Object.keys(fetched[0].body.state)], [["kind", "has_secret"], ["working_directory", "user_messages", "call"]]);
+		assert.deepEqual([Object.keys(fetched[1].body.questions), fetched[1].body.state], [["loosens"], { working_directory: cwd, call: { tool: "write", input: { path: "/tmp/notes.txt", content: "x" } } }]);
 		const logged = () => JSON.parse(readFileSync(join(agentDir, "pi-auto-review.jsonl"), "utf8").trim().split("\n").at(-1)!);
-		assert.deepEqual(logged().triage.usage, { input: 47, output: 0 }); // under pi's names, with no cost
+		assert.deepEqual(logged().triage.usage, { input: 94, output: 0 }); // both requests, under pi's names, with no cost
 		await call();
 		assert.equal(readFileSync(runs, "utf8"), "run\n"); // the command's key is kept
 		status = 429;
@@ -561,7 +613,18 @@ test("the triage model is called at its endpoint, as is, as System One, with the
 			await call();
 		}
 		assert.equal(readFileSync(runs, "utf8"), "run\nrun\nrun\n");
-		// A usage without a token count is only left out of the log: the triage model still clears the call.
+		// A usage without a token count is only left out of the log: the triage model still clears the call. When only
+		// one of the two requests reports one, that one is logged.
+		usage = { input_tokens: 47, output_tokens: 0 };
+		let reported = 0;
+		const twoRequests = globalThis.fetch;
+		globalThis.fetch = (async (url: string, init: any) => {
+			const response = await twoRequests(url, init);
+			return reported++ === 0 ? response : new Response(JSON.stringify({ ...(await response.json()), usage: null }));
+		}) as any;
+		await call();
+		assert.deepEqual(logged().triage.usage, { input: 47, output: 0 });
+		globalThis.fetch = twoRequests;
 		for (usage of [null, "n/a", [], {}, { input_tokens: "47" }]) {
 			assert.equal((await call()).setup?.by, "triage");
 			assert.deepEqual([logged().by, "usage" in logged().triage], ["triage", false]);
@@ -594,6 +657,7 @@ test("a 401 for an old key leaves a newer one, a key a header cannot carry is no
 	const auths: string[] = [];
 	let held: ((r: Response) => void) | undefined;
 	globalThis.fetch = (async (_url: string, init: any) => {
+		if (!("kind" in JSON.parse(init.body).questions)) return new Response(JSON.stringify({ answers: answers({ read: 1 }) })); // loosens, on its own
 		auths.push(init.headers.get("authorization"));
 		if (auths.length === 1) return new Promise<Response>((resolve) => (held = resolve)); // the old key's request, answered late
 		return new Response(JSON.stringify({ answers: answers({ read: 1 }) }));
@@ -938,7 +1002,7 @@ test("after any block, by a review, by the user, or on the extension's own files
 	const realFetch = globalThis.fetch;
 	// The triage model rates only `ls` routine.
 	globalThis.fetch = (async (_url: string, init: any) => {
-		seen.push("triage");
+		if ("kind" in JSON.parse(init.body).questions) seen.push("triage");
 		return new Response(JSON.stringify({ answers: JSON.parse(init.body).state.call.command === "ls" ? answers({ read: 1 }) : answers({ others: 1 }) }));
 	}) as any;
 	try {
