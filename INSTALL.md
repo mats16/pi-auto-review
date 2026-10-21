@@ -39,7 +39,7 @@ These steps are for a coding agent asked to install pi-auto-review for its user.
    }
    ```
 
-   Merge it into the file: keep every other key, including the `packages` entry step 2 added. If the file is not valid JSON, stop and tell the user rather than overwrite it. Do not write it to a project's `.pi/settings.json`, which pi-auto-review ignores. Leave the other settings (`triage.confidence`, `readOnlyTools`, `log`) unset unless the user asks for them; README.md describes them.
+   Merge it into the file: keep every other key, including the `packages` entry step 2 added. If the file is not valid JSON, stop and tell the user rather than overwrite it. Do not write it to a project's `.pi/settings.json`, which pi-auto-review ignores. Leave the other settings (`triage.confidence`, `triage.tools`, `readOnlyTools`, `log`) unset unless the user asks for them; README.md describes them.
 
 7. Check that `pi list` shows pi-auto-review. If triage is on and its `apiKey` is a `!` command, check that the command prints a token without showing it: `key=$(<the command, without its !>) && [ -n "$key" ] && echo ok`; if it does not print `ok`, tell the user, since every triage call would fail and go to the reviewer. Then tell the user what you set, that it loads in the next pi session (restart pi; in T3 Code, start a new thread), and that `/auto-review` lists the calls it denied.
 

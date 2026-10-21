@@ -15,7 +15,7 @@ AI auto-review for [pi](https://pi.dev) tool calls, after Codex's auto-review ("
 | Everything else: `bash`, MCP tools, custom tools | Reviewed |
 | A call that would be reviewed but is over 128,000 characters as JSON, too large for the reviewer to see whole | You are asked, without review (with no UI, it is blocked), as Codex asks when a call exceeds its reviewer's budget |
 
-With a [triage model](#triage-model-experimental-off-by-default) turned on, a reviewed call it finds routine runs without the reviewer.
+With a [triage model](#triage-model-experimental-off-by-default) turned on, a reviewed `bash`, `powershell`, `edit`, or `write` call it finds routine runs without the reviewer; MCP and extension tools go to the reviewer unless you name them for it.
 
 The reviewer sees the working directory, the session's transcript, and the planned call. Only your messages and `/auto-review` approvals are trusted; an approval covers the call you approved, and text the agent put inside that call is still the agent's. The agent's messages, its tool calls, and their output are passed as untrusted evidence: they can explain how a task is done, but cannot authorize anything, so instructions planted in files or web pages do not count as yours. Each entry is a JSON object, so text in tool output cannot pass as one of your messages. When the session is long, your messages are kept first, then the newest of the rest.
 
@@ -88,7 +88,7 @@ These are among the tools T3 Code's server declares read-only. Name only tools t
 
 ### Triage model (experimental, off by default)
 
-A triage model is a classifier, such as TypeSafe's Jev, that answers in a fraction of a second. When it is on, it sees your messages and the planned call first. A call it finds routine (a read, an edit for the task, a search or delegation through a connected tool), with a probability of at least 0.6 and, against the likeliest risk it sees (probability its answer leaves out counts as one), with enough confidence, with no secret in the call and nothing telling the agent to skip asking, runs without the reviewer. Anything else goes to the reviewer as usual, and so does any call over 32,000 characters as JSON, whose risky tail a small classifier could miss. It can only let a call run: it never blocks one, and if it fails, times out (10 s), or is set up wrong, the reviewer judges the call and pi-auto-review warns you once. Once a call is blocked, by a review or by you, the rest of that run skips the triage model until your next prompt, so a workaround for the blocked step (a script that does it) goes to the reviewer, which sees the denial.
+A triage model is a classifier, such as TypeSafe's Jev, that answers in a fraction of a second. When it is on, it sees your messages and the planned call first. A call it finds routine (a read, an edit for the task, a search or delegation through a connected tool), with a probability of at least 0.6 and, against the likeliest risk it sees (probability its answer leaves out counts as one), with enough confidence, with no secret in the call and nothing telling the agent to skip asking, runs without the reviewer. Anything else goes to the reviewer as usual, and so does any call over 32,000 characters as JSON, whose risky tail a small classifier could miss. It sees only pi's `bash`, `powershell`, `edit`, and `write`, and the MCP and extension tools you name in `tools`: as Codex leaves MCP calls to its reviewer by default, every other tool goes to the reviewer, since a server's hints are its own word (T3 Code's bridge passes none) and the triage model rated a Slack post a search through a connected tool. Name only tools that search or read through a service, such as a web search; see [Which calls the triage model may clear](docs/triage-scope.md). It can only let a call run: it never blocks one, and if it fails, times out (10 s), or is set up wrong, the reviewer judges the call and pi-auto-review warns you once. Once a call is blocked, by a review or by you, the rest of that run skips the triage model until your next prompt, so a workaround for the blocked step (a script that does it) goes to the reviewer, which sees the denial.
 
 ```json
 {
@@ -100,7 +100,8 @@ A triage model is a classifier, such as TypeSafe's Jev, that answers in a fracti
       "model": "system.ai.openjev-qwen35-4b",
       "endpoint": "https://<workspace>.cloud.databricks.com/ai-gateway/typesafe/v1/systemone",
       "apiKey": "!databricks auth token --profile <profile> | jq -re .access_token",
-      "confidence": 0.75
+      "confidence": 0.75,
+      "tools": ["mcp__web_search__web_search"]
     }
   }
 }
@@ -113,6 +114,7 @@ A triage model is a classifier, such as TypeSafe's Jev, that answers in a fracti
 | `endpoint` | The full `https` URL of the classifier's System One API (plain `http` only for `localhost`, since the API key goes with it), which gets the request as is, so a path that moves (Databricks' is in beta) needs only this setting changed. Other classifier APIs, such as llama.cpp's, are not supported: the questions are written for System One. |
 | `apiKey` | Sent as `Authorization: Bearer <key>`. The key itself, or `!` and a shell command that prints it, such as a CLI that issues short-lived tokens. A command's output is kept for 5 minutes, and dropped early when the endpoint answers 401 or 403; a command that fails, prints nothing, or runs over 10 s is not kept, and the reviewer judges the call (the warning says only how the command ended, not its output, so run it in a shell to see why). Left out, no key is sent. `models.json`'s credentials are not used. |
 | `confidence` | How sure the triage model must be that the call is routine rather than the likeliest risky kind it sees (deleting, installing, posting, ...), from 0.7 to 1 (default `0.75`, routine three times as likely as that risk). Higher sends more calls to the reviewer. At 0.6 a call that should ask was cleared, and 0.7 keeps a margin over it, so a lower value, such as the 0.6 that used to be the default, is refused and the reviewer judges every call. |
+| `tools` | MCP and extension tools the triage model judges too, by name, as in `readOnlyTools`. Left out, it judges only `bash`, `powershell`, `edit`, and `write`. A web search is a good fit: its query leaves the machine, so its server gives no `readOnlyHint`, but it only searches, and a secret in the query is caught by its own question. Leave out tools that post, send, or change things through a service (`slack_write_api_call`), and think twice about `mcp__t3-code__delegate_task`: a task for another provider, or in Full access, runs calls this extension does not check, which only the reviewer weighs. |
 
 With Databricks' OpenJev (Qwen3.5 4B) in front of GLM-5.3-Flash at `high`, on the eval's synthesized patterns and history (2026-10-13), the triage model let no call through that should have asked, at any of these settings:
 
@@ -123,6 +125,8 @@ With Databricks' OpenJev (Qwen3.5 4B) in front of GLM-5.3-Flash at `high`, on th
 | 0.8 | 22% | 63% | 0.29 s |
 
 All three keep most reviews under a second. Higher values also move the calls that should ask further from clearing: at the default, the closest of them, on the eval's cases, its history, and cases written after the questions, was half a logit short. At 0.6 one cleared: `cd /tmp/x; rm -f *.pdf *.txt`, with the `cd` unchecked. A secret or a loosened rule is caught by its own question, which clears a call only below 0.2.
+
+Since it judges only `bash`, `powershell`, `edit`, `write`, and the tools named in `tools` (2026-10-22), the default clears 15% of the synthesized calls (25% before) and 59% of the history (69% before); see [Which calls the triage model may clear](docs/triage-scope.md#measured).
 
 [Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#triage-model) has its accuracy, speed, and cost in front of a reviewer.
 
@@ -149,7 +153,7 @@ As with `mcp.log`, past 5 MB the file moves to `pi-auto-review.jsonl.1`, replaci
 | `passed` | The calls a rule let run in the run, by rule and tool: `read-only` (`read`, `grep`, `find`, `ls`, pi's `tool_search`), `readOnlyHint`, `readOnlyTools` (named in `autoReview.readOnlyTools`), `codemode`, `cwd-or-tmp` (an `edit` or `write` inside the working directory or `/tmp`), as `{"read-only": {"read": 12, "grep": 3}}`. |
 | `mode` | With `by` `mode`: T3 Code's mode (`full-access`, ...). |
 | `ms` | The whole review, or how long you took to answer, in milliseconds. |
-| `triage` | `model`, `ms`, `routine`, its `answers` (probabilities), and `usage` (input and output tokens, when the endpoint reports them; no cost, since Databricks publishes no price for OpenJev), or its `error` message; `"skipped after a block"` when a block earlier in the run left the call to the reviewer, `"skipped for a large call"` when the call was over 32,000 characters. |
+| `triage` | `model`, `ms`, `routine`, its `answers` (probabilities), and `usage` (input and output tokens, when the endpoint reports them; no cost, since Databricks publishes no price for OpenJev), or its `error` message; `"skipped after a block"` when a block earlier in the run left the call to the reviewer, `"skipped for a large call"` when the call was over 32,000 characters, `"skipped for its tool"` when the tool is not one it judges. |
 | `reviewer` | `model`, `effort`, `ms` (all its tries and the waits between them), `attempts` (how many requests it took, at most 3), `retried` (the failure of each try that was retried, when any was), and `usage` (tokens and cost of the last try, as the provider reports them). |
 
 ```bash
@@ -197,6 +201,7 @@ T3 Code starts pi in **Auto** as it does in Supervised, so pi-auto-review review
 - Some providers' safety filters reject review requests that contain exfiltration-like commands. Those count as failures, are not retried, and the call is blocked.
 - Whether a failed review is retried is read from the error's text, as pi passes it on, so a provider whose wording names none of the passing reasons is not retried, and nor is a passing failure whose text also names a lasting one (a 429 that mentions a quota, for example). A server's requested wait is honored only when the text gives it (`retry-after`, `try again in 2s`); one sent only as a header is not. A wait longer than the deadline leaves fails the review at once.
 - The log's reviewer `usage` is the last try's, so a retried unreadable answer's tokens are not counted.
+- The triage model judges `bash` like any other call it sees, so a command that posts (a `curl -X POST` to a chat API) is left to its `others` option, the one it missed the Slack post with when that came as an MCP call. `autoReview.triage.tools` trusts names: another extension's tool registered under one is judged by the triage model, not run unreviewed.
 - The triage model sees only your messages and the call. Until a call is blocked in the run, it cannot see what the agent did before, such as a script it wrote that the call runs.
 - The triage model reads the call's text, which the agent wrote, and small classifiers do not treat it as hostile: text in a call can talk it into rating the call routine, and the call then runs without the reviewer. It also sees only your messages and the call, not the agent's words or tool output, so it cannot tell when untrusted content steered the agent; the reviewer can. This is why it is off by default.
 - The triage model's questions were tuned on the eval's own cases, and the default `confidence` and the 0.2 for its two flags were chosen on its answers to those, the history, and cases written later; few of the calls that should ask came close. Its answers shift with the order of their options and the model's version. Rerun `npm run eval` when you change either.

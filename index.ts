@@ -27,7 +27,9 @@
  * at reasoning effort high unless the one named, or autoReview.effort, gives another. Through OpenAI's Responses API,
  * its answer is held to the verdict's JSON schema; other APIs answer in plain text.
  * With autoReview.triage turned on, a classifier (the triage model, such as TypeSafe's Jev) sees the user's
- * messages and the call first: a call it finds routine with a probability of at least 0.6, and routine rather than its
+ * messages and the call first, for pi's bash, powershell, edit, and write, and the MCP and extension tools named in
+ * autoReview.triage.tools; any other tool goes to the reviewer, as Codex leaves MCP calls to its reviewer by default.
+ * A call it finds routine with a probability of at least 0.6, and routine rather than its
  * likeliest risk (probability its answer leaves out counts as one) with enough confidence, runs without the reviewer, and
  * anything else, or its failure, goes to the reviewer. It can only let a call run, never block one, and after any call
  * is blocked, the rest of that run goes to the reviewer alone, as does any call over 32,000 characters. It is off by
@@ -97,6 +99,12 @@ const TRIAGE_ROUTINE = 0.6;
 const TRIAGE_FLAG = 0.2;
 /** The kinds of call the triage model may let run: as POLICY has it, routine work. */
 const ROUTINE_KINDS = ["read", "edit", "connected"];
+/**
+ * pi's tools the triage model judges. MCP and extension tools go to the reviewer unless autoReview.triage.tools names
+ * them: their servers' hints are missing or the server's word, and the triage model rated a Slack post a search
+ * through a connected tool (docs/triage-scope.md).
+ */
+const TRIAGE_TOOLS = ["bash", "powershell", "edit", "write"];
 const MAX_CHARS = 4_000;
 // A call over this goes to the user. The reviewer sees it whole, so its context window must hold this, the transcript,
 // and POLICY; 128,000 characters fit with room in GLM-5.3-Flash's million tokens, and the eval checks that a risky
@@ -617,9 +625,10 @@ type Classify = (context: ClassifierContext, signal: AbortSignal) => Promise<{ a
 /**
  * The triage model from autoReview.triage, when "enabled" is true: a classifier that lets routine calls run without
  * the reviewer. It is called at "endpoint", the full URL of a System One API, as "model", with "apiKey" as its bearer
- * token. A setting that cannot be used is returned as an error, and the reviewer judges every call.
+ * token. It judges only the calls of its `tools`: TRIAGE_TOOLS and the names in "tools". A setting that cannot be used
+ * is returned as an error, and the reviewer judges every call.
  */
-export function triageModel(own: Settings = settings()): { spec: string; confidence: number; classify: Classify } | { error: string } | undefined {
+export function triageModel(own: Settings = settings()): { spec: string; confidence: number; tools: string[]; classify: Classify } | { error: string } | undefined {
 	const triage = own.triage;
 	if (triage?.enabled !== true) return undefined;
 	const spec = typeof triage.model === "string" ? triage.model : "";
@@ -638,7 +647,9 @@ export function triageModel(own: Settings = settings()): { spec: string; confide
 	if (keySetting !== undefined && (typeof keySetting !== "string" || keySetting.replace(/^!/, "").trim() === "")) {
 		return { error: "autoReview.triage.apiKey must be the key, or ! and a command that prints it." };
 	}
-	return { spec, confidence, classify: (context, signal) => systemOne(spec, String(endpoint), keySetting, context, signal) };
+	const named = triage.tools ?? [];
+	if (!Array.isArray(named) || !named.every((name) => typeof name === "string")) return { error: "autoReview.triage.tools must be a list of tool names." };
+	return { spec, confidence, tools: [...TRIAGE_TOOLS, ...named], classify: (context, signal) => systemOne(spec, String(endpoint), keySetting, context, signal) };
 }
 
 // ponytail: a fixed 5 minutes from the command's start, not the token's own expiry; a 401 or 403 drops it early, and a
@@ -776,6 +787,10 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		if (!useTriage) skipped = "skipped after a block";
 		else if (plannedCall(toolName, input).length > TRIAGE_MAX_CALL_CHARS) skipped = "skipped for a large call";
 		triage = skipped === undefined ? triageModel(own) : undefined;
+		if (triage !== undefined && "tools" in triage && !triage.tools.includes(toolName)) {
+			skipped = "skipped for its tool";
+			triage = undefined;
+		}
 	} catch (error) {
 		return unreviewed(`Cannot read the reviewer from pi's settings.json: ${error instanceof Error ? error.message : error}`);
 	}

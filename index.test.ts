@@ -337,6 +337,11 @@ test("triageModel is off unless autoReview.triage.enabled is true, and reports a
 	assert.match(triageOf({ enabled: true, model: "jev-latest", endpoint, confidence: 0.6 }), /confidence must be a number from 0.7 to 1/);
 	assert.match(triageOf({ enabled: true, model: "jev-latest", endpoint, confidence: 1.1 }), /confidence must be/);
 	assert.match(triageOf({ enabled: true, model: "jev-latest", endpoint, confidence: "0.5" }), /confidence must be/);
+	// pi's shell and file tools, and the MCP and extension tools the user names.
+	const toolsOf = (tools?: unknown) => (triageModel({ triage: { enabled: true, model: "jev-latest", endpoint, tools } }) as { tools?: string[]; error?: string });
+	assert.deepEqual(toolsOf().tools, ["bash", "powershell", "edit", "write"]);
+	assert.deepEqual(toolsOf(["mcp__web_search__web_search"]).tools, ["bash", "powershell", "edit", "write", "mcp__web_search__web_search"]);
+	for (const tools of ["mcp__web_search__web_search", [7], { web_search: true }]) assert.match(toolsOf(tools).error!, /autoReview.triage.tools must be a list of tool names/);
 });
 
 test("apiKey is the setting as written, or what its ! command prints, kept five minutes; a failure is not kept", async () => {
@@ -381,7 +386,7 @@ test("triageState gives the triage model only the trusted entries and the call, 
 const MAX_CALL_FOR_TEST = 129_000; // over the 128,000-character limit, so the user is asked
 
 /** A session with the triage model turned on: its endpoint answers as given (or throws), and the reviewer allows. */
-async function triaged(classify: () => Promise<object>, triage: object = {}, signal?: AbortSignal, own: object = {}, command = "ls") {
+async function triaged(classify: () => Promise<object>, triage: object = {}, signal?: AbortSignal, own: object = {}, command: string | [string, unknown] = "ls") {
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { ...own, triage: { enabled: true, model: "jev-latest", endpoint: "https://gw.example/systemone", ...triage } } }));
 	const seen: string[] = [];
 	const ctx: any = fakeCtx('{"outcome":"allow"}', seen);
@@ -389,7 +394,8 @@ async function triaged(classify: () => Promise<object>, triage: object = {}, sig
 	const realFetch = globalThis.fetch;
 	globalThis.fetch = (async () => (seen.push("triage"), new Response(JSON.stringify({ answers: await classify(), usage: { input_tokens: 50, output_tokens: 0 } })))) as any;
 	try {
-		return { verdict: await review(ctx, "bash", { command }), seen, ctx };
+		const [toolName, input] = typeof command === "string" ? ["bash", { command }] : command;
+		return { verdict: await review(ctx, toolName, input), seen, ctx };
 	} finally {
 		globalThis.fetch = realFetch;
 		rmSync(join(agentDir, "settings.json"));
@@ -422,6 +428,15 @@ test("a routine call the triage model clears runs without the reviewer; anything
 		throw new Error("This operation was aborted");
 	}, {}, aborted.signal);
 	assert.deepEqual([stopped.verdict.risk, stopped.verdict.warning, stopped.seen], ["unknown", undefined, ["triage"]]);
+	// An MCP or extension tool goes to the reviewer unless named: the triage model rated a Slack post a connected-tool search.
+	const post: [string, unknown] = ["mcp__slack__slack_write_api_call", { endpoint: "chat.postMessage", params: { channel: "C0", text: "hi" } }];
+	const unnamed = await triaged(async () => answers({ connected: 0.9, others: 0.1 }), {}, undefined, {}, post);
+	assert.deepEqual([unnamed.seen, unnamed.verdict.setup?.triage], [["review:high"], "jev-latest, confidence 0.75 (skipped for its tool)"]);
+	const search: [string, unknown] = ["mcp__web_search__web_search", { query: "sqlite-vec" }];
+	const named = await triaged(async () => answers({ connected: 0.9, others: 0.1 }), { tools: ["mcp__web_search__web_search"] }, undefined, {}, search);
+	assert.deepEqual([named.seen, named.verdict.setup?.by], [["triage"], "triage"]);
+	assert.deepEqual((await triaged(async () => answers({ connected: 1 }), { tools: ["mcp__web_search__web_search"] }, undefined, {}, post)).seen, ["review:high"]);
+	assert.deepEqual((await triaged(async () => answers({ edit: 1 }), {}, undefined, {}, ["write", { path: "/etc/hosts", content: "" }])).seen, ["triage"]);
 	const off = await triaged(async () => answers({ read: 1 }), { endpoint: "" });
 	assert.deepEqual(off.seen, ["review:high"]);
 	assert.match(off.verdict.warning!, /triage model is off/);
@@ -508,6 +523,10 @@ test("autoReview.log appends each review to pi-auto-review.jsonl: who decided, t
 		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { log: true, triage: { enabled: true, model: "jev-latest", endpoint: "https://gw.example/systemone" } } }));
 		await review(fakeCtx('{"outcome":"allow"}', []) as any, "bash", { command: "ls" }, { triage: false });
 		assert.deepEqual([JSON.parse(readFileSync(file, "utf8")).triage, JSON.parse(readFileSync(file, "utf8")).by], ["skipped after a block", "reviewer"]);
+		rmSync(file);
+		// And for a tool it does not judge.
+		await review(fakeCtx('{"outcome":"allow"}', []) as any, "mcp__slack__slack_write_api_call", { endpoint: "chat.postMessage" });
+		assert.deepEqual([JSON.parse(readFileSync(file, "utf8")).triage, JSON.parse(readFileSync(file, "utf8")).by], ["skipped for its tool", "reviewer"]);
 		rmSync(file);
 		// A log that cannot be written leaves the verdict as it was.
 		mkdirSync(file);
