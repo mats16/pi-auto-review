@@ -1,6 +1,8 @@
-# Which calls the triage model may clear
+# Which calls the triage model may clear, and what raises `loosens`
 
 Decided on 2026-10-22, with Codex's auto-review (openai/codex `a6839a4`) as the model.
+
+A **call that writes** means, in both parts below, one that puts text into a file, a message, a setting, or a task for another agent: `edit` and `write`, a command with a redirect, heredoc, or `sed -i`, a post through an MCP tool, a delegated task. Only `edit` and `write` can be told by name; for a command or an MCP tool it takes reading the call.
 
 ## The miss
 
@@ -70,3 +72,31 @@ On the eval's cases (81 synthesized, 80 history), OpenJev at `confidence` 0.75, 
 | Closest MCP call that should ask | 0.51, a subagent asked to turn the reviewer off (`loosens` alone held it) | not judged |
 
 The closest call is a shell command that posts, which this change leaves to triage (README's Limits). The eval gained the miss as a case (a bug report posted to a channel the user did not name), which now goes to the reviewer, and the reviewer denies it.
+
+## `loosens` raised on calls that write nothing
+
+In the same log, 528 of the 953 calls the triage model left to the reviewer went there for `loosens` alone (at least 0.2, `TRIAGE_FLAG`); the reviewer allowed 527 at `low`, and one review timed out. They came from six sessions, where nearly every call raised it (146 of 149, 126 of 126, 76 of 76), and many of them wrote nothing (`ls -la`, a status check, a page fetched). Two sessions' first message said the user had answered the checklist the working directory's AGENTS.md asks for, so the agent should proceed without asking; four were a comment watcher's prompt ("call the same command again right away, without thinking", "Do not fix anything. Do not reply."). A watcher's command went to the reviewer 239 times in 241, about 25 minutes of waiting in the 37 hours.
+
+### The cause
+
+Sample calls from the six sessions (19), and calls that write a rule to skip asking (4, each with three user messages: none about asking, "proceed without asking" in Japanese, and in English), asked again with the user's messages (a) as sent, (b) removed, (c) with only the suspect sentences cut:
+
+| | (a) as sent | (b) no user messages | (c) sentences cut |
+|---|---|---|---|
+| The two "proceed without asking" sessions | 0.27–0.73 | 0.03–0.13 | 0.13–0.47 |
+| The four watcher sessions | 0.16–0.29 | 0.03–0.10 | 0.13–0.27 |
+| Calls that write a rule to skip asking | 0.29–0.95 | 0.41–0.75 | |
+
+The user's messages raise the flag on calls that write nothing, and the suspect sentences are not all of it: with them cut, half the samples still raise it. They also move it where it matters: a delegated task telling a subagent to turn the reviewer off scored 0.29 to 0.65 with the wording of the user's request around it, 0.41 alone. Rewording the watcher's prompt (dropping "without thinking", or "Do not fix anything. Do not reply.") moves its calls by up to a tenth, across the flag or not.
+
+### Options
+
+| | Of the 528, now cleared | Calls that write a rule to skip asking | Requests and tokens |
+|---|---|---|---|
+| **A** (recommended): ask `loosens` in a request of its own, with only the working directory and the call | 521 (525 under 0.2; 4 fail on `kind`) | lowest 0.62 on the eval's cases (0.41 before), 1.9 logits above the flag; the user's "proceed without asking" cannot lower it, since the question never sees it | Two requests per call, sent at once; the second is about 240 input tokens against about 2,300 |
+| **A, for every question**: drop the user's messages from the one request | the same | the same | One request, but history cleared falls from 58% to 31%: `kind` needs to know the task |
+| **B**: ask `loosens` only of calls that write | at most the 451 rated `read` or `connected`, by the classifier's own kind | `connected` covers delegated tasks, so a task telling a subagent to skip the checks would go unasked | Unchanged; whether a command writes cannot be told without the classifier |
+| **C**: reword the question (judge only the text `call` writes; the user's own wishes are `not_for`) | few: the two sessions still 0.20–0.71, one watcher 0.53 | 0.20–0.97 | Unchanged |
+| **D**: raise the flag | 287 at 0.3, 470 at 0.6 | With the user's messages beside it, 0.29 for the lowest, under a samples' 0.73: no value separates them | Unchanged |
+
+A, because it is the only one that makes the question answer what it asks: whether the call's own text loosens a rule. It also removes the way around it that the others keep, a user message (or text that passes for one) saying to proceed without asking. Of 249 calls the triage model cleared, replayed the same way, one now raises it (0.20, a delegated task, which the reviewer judges since the change above); one history case does (0.25), a command that runs pi with `--no-extensions`, and so without this reviewer. The flag stays at 0.2. The triage model still sees the user's messages for `kind` and `has_secret`.
