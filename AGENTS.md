@@ -9,6 +9,7 @@ pi-auto-review is a [pi](https://pi.dev) extension modeled on Codex's auto-revie
 - `review.eval.ts`: replays the prompts the user approved in T3 Code's history and lists those that still ask, and checks patterns synthesized from it (calls that must run, and the risky variants that must still be denied), against a live reviewer. Local only.
 - `.github/workflows/pullfrog.yml`: generated; edit only where it says so.
 - `.github/workflows/publish.yml`: publishes to npm when a GitHub release is published; the tag must match `version` in `package.json`.
+- `INSTALL.md`: steps for an agent asked to install the package (README links it); keep it in step with README's Install and Configure.
 - `.github/ISSUE_TEMPLATE/misjudgment.md`: the issue `/auto-review-report` drafts; keep their headings the same.
 
 ## Commands
@@ -25,7 +26,7 @@ No `npm install` is needed. Keep imports from `@earendil-works/*` type-only (`im
 - Fail closed. A review that fails, times out, or cannot be parsed blocks the call, never runs, and the agent is told it was a review failure. A critical call is blocked whatever the reviewer says. The one exception is T3 Code's Full access, where nothing is reviewed and everything runs, as in Codex. Apart from it, only the opt-in triage model (`autoReview.triage`, off by default) lets a call run without the reviewer: a call it rates routine. It never blocks one, and when it fails or is set up wrong, the reviewer judges the call. After any call is blocked, by a review or by the user, the rest of the run goes to the reviewer alone.
 - Only the user's messages, and the approvals `/auto-review` sends, are trusted. The reviewer sees the transcript, but tool output and the agent's own words go in as untrusted evidence, one JSON object per entry, so they cannot pass as user messages.
 - Calls on this extension's own files are always blocked, without asking and never left to the reviewer; the block points to `read`, `grep`, `find`, and `ls` for reading them. In Full access they run like everything else. Text that only names the folder for an agent whose own calls this extension still checks (a compaction note, a task for a pi subagent outside Full access) is not such a call, and nor is a codemode script: each tool it calls is checked on its own.
-- When behavior changes, update the header comment in `index.ts`, `POLICY` if relevant, and the README tables and Limits together.
+- When behavior changes, update the header comment in `index.ts`, `POLICY` if relevant, the README tables and Limits, and `INSTALL.md` if it touches the settings it writes, together.
 - Mark known shortcuts with a `// ponytail:` comment that names the limit, and list user-visible ones in README's Limits.
 - Add a test for every change to a decision function. After a `POLICY` change, run `npm run eval` with the reviewer in use.
 - Indent with tabs.
