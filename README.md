@@ -40,6 +40,12 @@ pi install git:github.com/mats16/pi-auto-review
 
 To try it for one run: `pi -e npm:@mats16/pi-auto-review`. Add `@<version>` (npm) or `@<tag>` (git) to pin a release; `pi update --extensions` moves an unpinned install to the latest. It needs no dependencies beyond pi itself.
 
+Or ask a coding agent to install it; it asks you, one question per turn, which reviewer model to use and whether to turn on the triage model:
+
+```text
+Install pi-auto-review by following https://raw.githubusercontent.com/mats16/pi-auto-review/main/INSTALL.md
+```
+
 ## Configure
 
 The reviewer is the first of these that is set:
@@ -93,7 +99,7 @@ A triage model is a classifier, such as TypeSafe's Jev, that answers in a fracti
       "enabled": true,
       "model": "system.ai.openjev-qwen35-4b",
       "endpoint": "https://<workspace>.cloud.databricks.com/ai-gateway/typesafe/v1/systemone",
-      "apiKey": "!databricks auth token --profile <profile> | jq -r .access_token",
+      "apiKey": "!databricks auth token --profile <profile> | jq -re .access_token",
       "confidence": 0.75
     }
   }
