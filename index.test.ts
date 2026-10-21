@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import autoReview, { apiKey, approvalDetails, approvalMessage, issue, issueUrl, triageModel, triageState, needsReview, parseVerdict, readOnly, review, reviewer, routine, touches, transcript } from "./index.ts";
+import autoReview, { apiKey, approvalDetails, approvalMessage, issue, issueUrl, triageModel, triageState, needsReview, parseVerdict, readOnly, retryDelay, review, reviewer, routine, touches, transcript, transient } from "./index.ts";
 
 const cwd = "/work/project";
 // The reviewer reads pi's user settings.json; keep the user's own out of every test.
@@ -724,8 +724,111 @@ test("a critical call is blocked even when the reviewer allows it, and the agent
 
 test("a review that did not happen blocks the call, and says it is not a judgment of the call", async () => {
 	const { blocked, reason, seen } = await runCall(undefined, "no verdict here");
-	assert.deepEqual([blocked, seen], [true, ["review:high"]]);
-	assert.match(reason, /could not review bash.*review failure, not a determination/);
+	// An unreadable answer is tried again, as Codex retries a parse failure, up to three times.
+	assert.deepEqual([blocked, seen], [true, ["review:high", "review:high", "review:high"]]);
+	assert.match(reason, /could not review bash, so it did not run: Unreadable review: no verdict here \(3 attempts\).*review failure, not a determination/);
+});
+
+test("transient tells the failures Codex retries (rate limits, overload, 5xx, 408, 429, dropped connections) from those it does not", () => {
+	for (const message of ["Review failed: Request timed out.", "Review failed: Connection error.", "Review failed: terminated", "Review failed: 429 Too Many Requests", "Review failed: Rate limit exceeded", "Review failed: OpenAI API error (503): Service Unavailable", "Review failed: 500 Internal Server Error", "Review failed: Overloaded", "Review failed: 408 Request Timeout", "Review failed: fetch failed"]) {
+		assert.equal(transient(message), true, message);
+	}
+	for (const message of ["Review failed: 400 Bad Request", "Review failed: 401 Unauthorized", "Review failed: prompt is too long: 1200000 tokens > 1000000 maximum, the context window", "Review failed: 429 You exceeded your current quota (insufficient_quota)", "Review failed: content_filter", "Review failed: aborted", "Review failed: Request was aborted.", "Review failed: something else"]) {
+		assert.equal(transient(message), false, message);
+	}
+});
+
+test("retryDelay waits 200 ms doubled each attempt, give or take 10%, and never less than the server asked", () => {
+	for (const [attempt, ms] of [[1, 200], [2, 400], [3, 800]]) {
+		const wait = retryDelay(attempt, "Review failed: 503");
+		assert.ok(wait >= ms * 0.9 && wait <= ms * 1.1, `${attempt}: ${wait}`);
+	}
+	assert.equal(retryDelay(1, "Review failed: 429 Rate limit reached. Please try again in 1.5s."), 1500);
+	assert.equal(retryDelay(1, "Review failed: 429 retry-after: 2"), 2000);
+	assert.equal(retryDelay(1, "Review failed: Server requested 120s retry delay (max: 60s). 429"), 120_000);
+	assert.ok(retryDelay(1, "Review failed: 429 try again in 20ms") >= 180); // never sooner than the backoff
+});
+
+/** A session whose reviewer gives these answers in turn (a text, or a failed response's error), counting the requests. */
+function retryCtx(answers: (string | { error: string } | (() => object))[], signal?: AbortSignal) {
+	const ctx = {
+		cwd,
+		model: {},
+		signal,
+		sessionManager: { getBranch: () => [] },
+		requests: 0,
+		modelRegistry: {
+			streamSimple: () => ({
+				result: async () => {
+					const answer = answers[ctx.requests++];
+					if (typeof answer === "function") return answer();
+					if (typeof answer === "string") return { stopReason: "stop", content: [{ type: "text", text: answer }] };
+					return { stopReason: "error", errorMessage: answer.error, content: [] };
+				},
+			}),
+		},
+	};
+	return ctx;
+}
+
+test("a transient review failure is tried again within the one 90 s deadline, up to three times, and logged with its attempts", async () => {
+	const allow = JSON.stringify({ outcome: "allow" });
+	const file = join(agentDir, "pi-auto-review.jsonl");
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { log: true } }));
+	try {
+		// The case that blocked a safe call: an HTTP timeout at 70 s, with 20 s of the deadline left.
+		const timedOut = retryCtx([{ error: "Request timed out." }, allow]);
+		assert.deepEqual([(await review(timedOut as any, "bash", { command: "x" })).outcome, timedOut.requests], ["allow", 2]);
+		const line = JSON.parse(readFileSync(file, "utf8"));
+		assert.deepEqual([line.reviewer.attempts, line.reviewer.retried], [2, ["Review failed: Request timed out."]]);
+		rmSync(file);
+		// Three tries at most, and the reason says how many it took.
+		const down = retryCtx([{ error: "503 Service Unavailable" }, { error: "Connection error." }, { error: "503 Service Unavailable" }, allow]);
+		const failed = await review(down as any, "bash", { command: "x" });
+		assert.deepEqual([failed.outcome, failed.risk, failed.reason, down.requests], ["deny", "unknown", "Review failed: 503 Service Unavailable (3 attempts)", 3]);
+		assert.equal(JSON.parse(readFileSync(file, "utf8")).reviewer.attempts, 3);
+	} finally {
+		rmSync(file, { force: true });
+		rmSync(join(agentDir, "settings.json"), { force: true });
+	}
+	// A failure that would fail the same way again is not retried.
+	for (const error of ["401 Unauthorized", "prompt is too long: context window exceeded", "429 insufficient_quota"]) {
+		const ctx = retryCtx([{ error }, allow]);
+		assert.deepEqual([(await review(ctx as any, "bash", { command: "x" })).reason, ctx.requests], [`Review failed: ${error}`, 1]);
+	}
+});
+
+test("a review is not retried past its deadline, nor after the session's abort", async () => {
+	const allow = JSON.stringify({ outcome: "allow" });
+	// A server's wait longer than the deadline leaves fails now, rather than waiting for the deadline.
+	const later = retryCtx([{ error: "429 Too Many Requests. Please try again in 120s." }, allow]);
+	assert.deepEqual([(await review(later as any, "bash", { command: "x" })).outcome, later.requests], ["deny", 1]);
+	// So does a failure that comes with less than the backoff left before the deadline.
+	mock.timers.enable({ apis: ["Date"], now: Date.now() });
+	try {
+		const late = retryCtx([() => (mock.timers.tick(89_900), { stopReason: "error", errorMessage: "Connection error.", content: [] }), allow]);
+		assert.deepEqual([(await review(late as any, "bash", { command: "x" })).reason, late.requests], ["Review failed: Connection error.", 1]);
+	} finally {
+		mock.timers.reset();
+	}
+	// The deadline passing in a request ends the review, and says so.
+	const deadline = new AbortController();
+	const timeout = mock.method(AbortSignal, "timeout", () => deadline.signal);
+	try {
+		const cut = retryCtx([() => (deadline.abort(), { stopReason: "aborted", errorMessage: "Request was aborted.", content: [] }), allow]);
+		assert.deepEqual([(await review(cut as any, "bash", { command: "x" })).reason, cut.requests], ["Review failed: timed out (90 s, 1 attempt)", 1]);
+	} finally {
+		timeout.mock.restore();
+	}
+	// The session's abort ends it at once, in a request or in the wait before the next one.
+	const during = new AbortController();
+	const aborted = retryCtx([() => (during.abort(), { stopReason: "aborted", content: [] }), allow], during.signal);
+	assert.deepEqual([(await review(aborted as any, "bash", { command: "x" })).reason, aborted.requests], ["Review failed: aborted", 1]);
+	const waiting = new AbortController();
+	const waited = retryCtx([() => (setTimeout(() => waiting.abort(), 20), { stopReason: "error", errorMessage: "Connection error.", content: [] }), allow], waiting.signal);
+	const started = Date.now();
+	assert.deepEqual([(await review(waited as any, "bash", { command: "x" })).reason, waited.requests], ["Review failed: aborted", 1]);
+	assert.ok(Date.now() - started < 150);
 });
 
 test("calls on the extension's own files skip the reviewer and are blocked without asking, with a pointer to the read tools", async () => {
@@ -840,7 +943,8 @@ test("after any block, by a review, by the user, or on the extension's own files
 			};
 			assert.deepEqual(await run("ls"), { blocked: false, seen: ["triage"] });
 			assert.equal((await run(blockedCall)).blocked, true);
-			assert.deepEqual((await run("ls")).seen, ["review:high"]); // the same run: the reviewer judges it, with the denial in view
+			// The same run: the reviewer judges it, with the denial in view (and retries a reviewer that cannot answer).
+			assert.deepEqual([...new Set((await run("ls")).seen)], ["review:high"]);
 			await handlers.agent_start({ type: "agent_start" });
 			assert.deepEqual(await run("ls"), { blocked: false, seen: ["triage"] }); // the next prompt starts clean
 		}
