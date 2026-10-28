@@ -206,14 +206,17 @@ On the review log of 2026-10-26 to 28: 963 calls, each rebuilt with the user's m
 - Jev 1.14 rejected 15 of the 963 (1.6%) with `max_tokens_exceeded`: those OpenJev read at 48,600 to 53,100 input tokens; the longest Jev 1.14 answered was 34,090 of its own. They go to the reviewer.
 - With four requests in flight, 833 of its 963 calls hit the workspace's limit on input tokens per minute (OpenJev at the same time: none), and with two, 492 of those 833 still did, so the log replay waited 15 s after each and asked again. The log's calls carry long user messages; the eval's short ones never hit it, at four in flight or at eight in the live eval.
 
-With GLM-5.3-Flash at `high` behind it, in the live eval (`npm run eval`, OpenJev three times after the case set was final, Jev 1.14 twice):
+With GLM-5.3-Flash at `high` behind it, in the live eval (`npm run eval`, OpenJev three times after the case set was final, Jev 1.14 twice at each `confidence`):
 
 | Setup | Synthetic wrong / reviews | Of which by the triage model | History: ran | Decided by the triage model (synthetic / history) | Median review |
 |---|---|---|---|---|---|
 | OpenJev → GLM-5.3-Flash | 1 / 330 | 0 | 77 / 80 (96%) | 18% / 58% | 2.9 s |
 | Jev 1.14 → GLM-5.3-Flash | 3 / 220 | 2 (the `cd` deletion, both runs) | 77–78 / 80 | 34% / 79% | 1.4 s |
+| Jev 1.14 at 0.95 → GLM-5.3-Flash | 1 / 220 | 0 | 74–77 / 80 | 27% / 48% | 2.6 s |
 
-GLM-5.3-Flash's own mistakes were an extra ask on the dependency bump after `/auto-review` (behind OpenJev) and a missed global upgrade the user ruled out (behind Jev 1.14), both seen before. The history column counts the `cd` deletion as ran for Jev 1.14.
+GLM-5.3-Flash's own mistakes were an extra ask on the dependency bump after `/auto-review` (behind OpenJev) and a missed global upgrade the user ruled out (behind Jev 1.14), both seen before. The history column counts the `cd` deletion as ran for Jev 1.14 at the default. At 0.95 the triage model passed it on, and the reviewer denied it in one run and allowed it in the other; the one wrong review was the reviewer's extra ask on a new deck in the user's Drive folder. The median review is over every reviewed call in each run's log, counted the same way for both Jev 1.14 rows.
+
+No other way of turning Jev 1.14's answers into "routine" did better than this rule at 0.95, on the recorded answers or on 60 cases written afterward, where the default cleared a call that should ask and 0.95 cleared none: see [Fitting the triage rule to a model](triage-logic.md).
 
 ## Choosing
 
