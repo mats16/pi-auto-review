@@ -126,6 +126,8 @@ With Databricks' OpenJev (Qwen3.5 4B) in front of GLM-5.3-Flash at `high`, on th
 
 All three keep most reviews under a second. Higher values also move the calls that should ask further from clearing: at the default, the closest of them, on the eval's cases, its history, and cases written after the questions, was half a logit short. At 0.6 one cleared: `cd /tmp/x; rm -f *.pdf *.txt`, with the `cd` unchecked. A secret or a loosened rule is caught by its own question, which clears a call only below 0.2.
 
+TypeSafe's Jev 1.14 (`system.ai.typesafeai-jev-1-14-0`, 2026-10-28) clears more at the default, but there it cleared that same `cd` deletion, and the eval's version of it, in every run. Stopping the eval's version took 0.95, a value chosen on those same cases, and at 0.95 it clears less of the history than OpenJev. It also hits Databricks' limit on input tokens per minute sooner, and reads less context. See [Jev 1.14](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#jev-114).
+
 Since it judges only `bash`, `powershell`, `edit`, `write`, and the tools named in `tools` (2026-10-22), the default clears 15% of the synthesized calls (25% before) and 59% of the history (69% before); see [Which calls the triage model may clear](docs/triage-scope.md#measured). Asking `loosens` about the call alone, the lowest of the calls that write a rule to skip asking rose from 0.41 to 0.62, and the calls that should run cleared went from 30% to 37% ([Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#tools-it-judges-and-loosens-alone)).
 
 [Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#triage-model) has its accuracy, speed, and cost in front of a reviewer.
