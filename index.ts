@@ -33,8 +33,9 @@
  * routine with a probability of at least 0.6, and routine rather than its likeliest risk (probability its answer leaves
  * out counts as one) with enough confidence, runs without the reviewer, and anything else, or its failure, goes to the
  * reviewer. It can only let a call run, never block one, and after any call is blocked, the rest of that run goes to
- * the reviewer alone, as does any call over 32,000 characters and any command with both a cd and an rm, since the
- * triage model cleared `cd x; rm ...`, which deletes wherever the shell is if the cd fails. It is off by default.
+ * the reviewer alone, as does any call over 32,000 characters and any command that names both a cd and a deletion (rm
+ * and its kin, a --delete flag, PowerShell's Remove-Item), since the triage model cleared `cd x; rm ...`, which deletes
+ * wherever the shell is if the cd fails. It is off by default.
  * It is called at autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with models.json's
  * credentials: the key itself, or "!" and a command that prints it, whose output is kept five minutes.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
@@ -790,14 +791,17 @@ export function routine(answers: Answers, confidence: number): boolean {
 // questions, and so is a name split by quotes (r''m), like any other text in a call that misleads it.
 export function cdAndDelete(command: string, powershell = false): boolean {
 	const [cd, remove] = powershell ? PS_CD_AND_DELETE : SH_CD_AND_DELETE;
-	return cd.test(command) && (remove.test(command) || /\s--?delete(?=[\s=;&|()'"]|$)/m.test(command));
+	return cd.test(command) && (remove.test(command) || DELETE_FLAG.test(command));
 }
 
 /**
  * A command name as a word: not part of a longer name or a variable, and ended by a space, a quote, or an operator.
- * A deletion may be named by its path (/bin/rm, ../bin/rm); a cd may not, since ./cd is some other program.
+ * A deletion may be named by its path (/bin/rm, ../bin/rm); a cd may not, since ./cd is some other program, but it may
+ * be followed by its argument with no space (cd.., PowerShell's cd/d). ${IFS} counts as a space.
  */
-const commandWord = (names: string, path = false) => new RegExp(`(?:^|[^\\w$${path ? "" : ".\\/"}-])(?:${names})(?=[\\s;&|()'"<>\\\\]|$)`, "im");
+const commandWord = (names: string, path = false) => new RegExp(`(?:^|[^\\w$${path ? "" : ".\\/"}-])(?:${names})(?=[\\s;&|()'"<>\\\\$${path ? "" : "./"}]|$)`, "im");
+/** find's -delete, and rsync's --delete, its --delete-after and kin, and --del, quoted or not. */
+const DELETE_FLAG = /(?:^|[\s'"])--?del(?:ete(?:-[\w-]+)?)?(?=[\s=;&|()'"]|$)/m;
 // PowerShell's own names only for PowerShell: in bash, words like del and rd are common in heredoc text.
 const SH_CD_AND_DELETE = [commandWord("cd|pushd"), commandWord("rm|rmdir|unlink|shred", true)];
 const PS_CD_AND_DELETE = [commandWord("cd|chdir|pushd|sl|set-location|push-location"), commandWord("rm|rmdir|unlink|shred|del|erase|rd|ri|remove-item", true)];
@@ -831,9 +835,9 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 			// bash's command with bash's names; any other call but an edit or write, whatever its fields and shell, with
 			// PowerShell's names too, so a shell tool named in autoReview.triage.tools is held to the same check.
 			const command = (input as { command?: unknown } | undefined)?.command;
-			const shell = toolName === "bash" ? (typeof command === "string" ? command : "") : FILE_TOOLS.has(toolName) ? "" : strings(input).join("\n");
+			const shell = () => (toolName === "bash" ? (typeof command === "string" ? command : "") : FILE_TOOLS.has(toolName) ? "" : strings(input).join("\n"));
 			if (!triage.tools.includes(toolName)) skipped = "skipped for its tool";
-			else if (cdAndDelete(shell, toolName !== "bash")) skipped = "skipped for a cd and a deletion";
+			else if (cdAndDelete(shell(), toolName !== "bash")) skipped = "skipped for a cd and a deletion";
 			if (skipped !== undefined) triage = undefined;
 		}
 	} catch (error) {

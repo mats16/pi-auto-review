@@ -330,7 +330,12 @@ test("cdAndDelete catches a shell command with both a cd and a deletion, however
 	}
 	assert.equal(cdAndDelete("cd $D; del old; rd out"), false);
 	assert.equal(cdAndDelete("cd x; ../tools/rm -rf y"), true);
-	assert.equal(cdAndDelete("cd x && node cli.js --delete-cache"), false);
+	for (const command of ["cd x; rsync -a --delete-after s/ .", "cd x; rsync -a --del s/ .", "cd x; find . '-delete'", "cd x; rm${IFS}-f y", "cd${IFS}x; rm y", "cd..; rm y"]) {
+		assert.equal(cdAndDelete(command), true, command);
+	}
+	assert.equal(cdAndDelete("cd/d C:\\x & rd /s y", true), true);
+	assert.equal(cdAndDelete("cd x && node cli.js --deleted"), false);
+	assert.equal(cdAndDelete("cd x && rm.py"), false);
 	assert.equal(cdAndDelete("cd x\npython3 - <<'E'\ndel d[k]\nE"), false);
 });
 
