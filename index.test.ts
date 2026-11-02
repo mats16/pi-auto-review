@@ -329,6 +329,8 @@ test("cdAndDelete catches a shell command with both a cd and a deletion, however
 		assert.equal(cdAndDelete(command, true), false, command);
 	}
 	assert.equal(cdAndDelete("cd $D; del old; rd out"), false);
+	assert.equal(cdAndDelete("cd x; ../tools/rm -rf y"), true);
+	assert.equal(cdAndDelete("cd x && node cli.js --delete-cache"), false);
 	assert.equal(cdAndDelete("cd x\npython3 - <<'E'\ndel d[k]\nE"), false);
 });
 
@@ -438,6 +440,12 @@ test("a routine call the triage model clears runs without the reviewer; anything
 	// So is a shell tool named in tools, and PowerShell's own names in a powershell call.
 	assert.deepEqual((await triaged(async () => answers({ read: 1 }), { tools: ["remote_exec"] }, undefined, {}, ["remote_exec", { command: "cd /srv/app; rm -rf build" }])).seen, ["review:high"]);
 	assert.deepEqual((await triaged(async () => answers({ read: 1 }), {}, undefined, {}, ["powershell", { command: "Set-Location $D; Remove-Item *.png" }])).seen, ["review:high"]);
+	// Whatever field and shell a named tool uses; and an unjudged tool keeps its own reason.
+	assert.deepEqual((await triaged(async () => answers({ read: 1 }), { tools: ["remote_exec"] }, undefined, {}, ["remote_exec", { script: "Set-Location $D; Remove-Item *.png" }])).seen, ["review:high"]);
+	const unjudged = await triaged(async () => answers({ read: 1 }), {}, undefined, {}, ["remote_exec", { command: "cd /srv/app; rm -rf build" }]);
+	assert.equal(unjudged.verdict.setup?.triage, "jev-latest, confidence 0.75 (skipped for its tool)");
+	// An edit's text is not run, so a script it writes is judged by the triage model as before.
+	assert.deepEqual((await triaged(async () => answers({ edit: 1 }), {}, undefined, {}, ["write", { path: "/tmp/clean.sh", content: "cd /tmp/x\nrm -f *.png\n" }])).seen, ["triage"]);
 	assert.match(clear.verdict.reason, /Routine \(jev-latest: read\)/);
 	// The reason names the likeliest routine kind, not the answer's choice, which can be a risky kind it outweighs.
 	const split = await triaged(async () => ({ ...answers({ edit: 0.2, read: 0.2, connected: 0.2, destroy: 0.2, others: 0.2 }), kind: { choice: "destroy", probabilities: { edit: 0.2, read: 0.2, connected: 0.2, destroy: 0.2, others: 0.2 } } }));
