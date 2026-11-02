@@ -786,8 +786,9 @@ export function routine(answers: Answers, confidence: number): boolean {
  * 2026-11-01 to 02, that was 81 of 1,847 calls, and 7 of the 1,148 the triage model had cleared that were not such a
  * deletion (docs/benchmarks.md).
  */
-// ponytail: by words, not by what the shell would do: text that only names rm or --delete (a heredoc, an echo) goes to
-// the reviewer too; other ways to destroy data (git clean, a script that deletes) are left to the triage model's
+// ponytail: by words, not by what the shell would do: text that only names rm or --delete (a heredoc, an echo), or, in
+// PowerShell and named tools, its short names (sl, del, rd, ri), goes to the reviewer too; other ways to change directory
+// (git -C, env -C) or destroy data (git clean, rsync --remove-source-files, a script) are left to the triage model's
 // questions, and so is a name split by quotes (r''m), like any other text in a call that misleads it.
 export function cdAndDelete(command: string, powershell = false): boolean {
 	const [cd, remove] = powershell ? PS_CD_AND_DELETE : SH_CD_AND_DELETE;
@@ -832,12 +833,10 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		else if (plannedCall(toolName, input).length > TRIAGE_MAX_CALL_CHARS) skipped = "skipped for a large call";
 		triage = skipped === undefined ? triageModel(own) : undefined;
 		if (triage !== undefined && "tools" in triage) {
-			// bash's command with bash's names; any other call but an edit or write, whatever its fields and shell, with
-			// PowerShell's names too, so a shell tool named in autoReview.triage.tools is held to the same check.
-			const command = (input as { command?: unknown } | undefined)?.command;
-			const shell = () => (toolName === "bash" ? (typeof command === "string" ? command : "") : FILE_TOOLS.has(toolName) ? "" : strings(input).join("\n"));
+			// Every string of any call but an edit or write, whatever its fields; with PowerShell's names too unless it is
+			// bash, so a shell tool named in autoReview.triage.tools is held to the same check.
 			if (!triage.tools.includes(toolName)) skipped = "skipped for its tool";
-			else if (cdAndDelete(shell(), toolName !== "bash")) skipped = "skipped for a cd and a deletion";
+			else if (!FILE_TOOLS.has(toolName) && cdAndDelete(strings(input).join("\n"), toolName !== "bash")) skipped = "skipped for a cd and a deletion";
 			if (skipped !== undefined) triage = undefined;
 		}
 	} catch (error) {

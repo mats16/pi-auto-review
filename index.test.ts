@@ -449,6 +449,8 @@ test("a routine call the triage model clears runs without the reviewer; anything
 	assert.deepEqual((await triaged(async () => answers({ read: 1 }), { tools: ["remote_exec"] }, undefined, {}, ["remote_exec", { script: "Set-Location $D; Remove-Item *.png" }])).seen, ["review:high"]);
 	const unjudged = await triaged(async () => answers({ read: 1 }), {}, undefined, {}, ["remote_exec", { command: "cd /srv/app; rm -rf build" }]);
 	assert.equal(unjudged.verdict.setup?.triage, "jev-latest, confidence 0.75 (skipped for its tool)");
+	// A bash call is read through every string too, so a command that is not one string is still checked.
+	assert.deepEqual((await triaged(async () => answers({ read: 1 }), {}, undefined, {}, ["bash", { command: ["cd x", "rm -rf *"] }])).seen, ["review:high"]);
 	// An edit's text is not run, so a script it writes is judged by the triage model as before.
 	assert.deepEqual((await triaged(async () => answers({ edit: 1 }), {}, undefined, {}, ["write", { path: "/tmp/clean.sh", content: "cd /tmp/x\nrm -f *.png\n" }])).seen, ["triage"]);
 	assert.match(clear.verdict.reason, /Routine \(jev-latest: read\)/);
