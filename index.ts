@@ -33,7 +33,8 @@
  * routine with a probability of at least 0.6, and routine rather than its likeliest risk (probability its answer leaves
  * out counts as one) with enough confidence, runs without the reviewer, and anything else, or its failure, goes to the
  * reviewer. It can only let a call run, never block one, and after any call is blocked, the rest of that run goes to
- * the reviewer alone, as does any call over 32,000 characters. It is off by default. It is called at
+ * the reviewer alone, as does any call over 32,000 characters and any bash command that deletes after a cd that may
+ * fail (cd x; rm ...), which the triage model cleared as routine. It is off by default. It is called at
  * autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with models.json's credentials: the
  * key itself, or "!" and a command that prints it, whose output is kept five minutes.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
@@ -775,6 +776,19 @@ export function routine(answers: Answers, confidence: number): boolean {
 	return sum + rounding >= TRIAGE_ROUTINE && sum + rounding >= confidence * (sum + risk) && clear("has_secret") && clear("loosens");
 }
 
+/**
+ * Whether a bash command deletes after a cd (or pushd) that may fail: one followed by `;`, a line break, or `||`, and
+ * then rm, rmdir, unlink, xargs rm, or find -delete anywhere later. If the cd fails, the deletion runs in whatever
+ * directory the shell is in. Jev 1.14 cleared such calls as routine, and a sentence about it in the kind question did
+ * not stop them; measured on the review log of 2026-10-26 to 28 and 2026-11-01 to 02, this sent 33 of 1,847 calls to
+ * the reviewer, 3 of the 1,148 the triage model had cleared that were not such a deletion (docs/benchmarks.md).
+ */
+// ponytail: by shape, not by what the shell would do: a `set -e` before it, or `cd x || exit`, still goes to the
+// reviewer, and a deletion hidden in a script or an alias is not seen; it only costs the triage model's speed-up.
+export function deletesAfterCd(command: string): boolean {
+	return /(?:^|[;&|(\n]\s*)(?:cd|pushd)\b[^;&|\n]*(?:;|\|\||\n)[\s\S]*(?:(?<=^|[;&|(`\n]|\$\()\s*(?:sudo\s+|command\s+)?(?:rm|rmdir|unlink)\b|\bxargs\b[^;&|\n]*\brm\b|\s-delete\b)/.test(command);
+}
+
 /** The routine kind the triage model rated likeliest, to name in the verdict: its "choice" can be a risky kind. */
 function likeliestRoutine(answers: Answers): string {
 	const p = answers.kind?.probabilities ?? {};
@@ -793,6 +807,7 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		picked = reviewer(ctx, own);
 		if (!useTriage) skipped = "skipped after a block";
 		else if (plannedCall(toolName, input).length > TRIAGE_MAX_CALL_CHARS) skipped = "skipped for a large call";
+		else if (toolName === "bash" && deletesAfterCd(String((input as { command?: unknown } | undefined)?.command ?? ""))) skipped = "skipped for a deletion after a cd that may fail";
 		triage = skipped === undefined ? triageModel(own) : undefined;
 		if (triage !== undefined && "tools" in triage && !triage.tools.includes(toolName)) {
 			skipped = "skipped for its tool";
