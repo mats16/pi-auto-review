@@ -318,7 +318,17 @@ test("cdAndDelete catches a shell command with both a cd and a deletion, however
 		assert.equal(cdAndDelete(command), false, command);
 	}
 	assert.equal(cdAndDelete(`cd x; ${"a; ".repeat(10_000)}`), false);
-	assert.equal(cdAndDelete("Set-Location $D; Remove-Item *.png", true), true);
+	for (const command of ['cd "$D"; \'rm\' -f *.png', '(cd $D;rm -f *)', "\\cd $D; rm -f *", "cd $D && rsync -a --delete src/ ./"]) {
+		assert.equal(cdAndDelete(command), true, command);
+	}
+	// PowerShell's own names count only in PowerShell.
+	for (const command of ["Set-Location $D; Remove-Item *.png", "chdir $D; del *.png", "sl $D; ri -r out", "Push-Location $D; rd old", "cd $D; rm *.png"]) {
+		assert.equal(cdAndDelete(command, true), true, command);
+	}
+	for (const command of ["Set-Location $D; Get-ChildItem", "Remove-Item C:\\tmp\\a.txt"]) {
+		assert.equal(cdAndDelete(command, true), false, command);
+	}
+	assert.equal(cdAndDelete("cd $D; del old; rd out"), false);
 	assert.equal(cdAndDelete("cd x\npython3 - <<'E'\ndel d[k]\nE"), false);
 });
 
@@ -425,6 +435,9 @@ test("a routine call the triage model clears runs without the reviewer; anything
 	const cdRm = await triaged(async () => answers({ read: 1 }), {}, undefined, {}, "D=/tmp/x; cd $D; rm -f *.png; ls");
 	assert.deepEqual([cdRm.seen, cdRm.verdict.setup?.triage], [["review:high"], "jev-latest, confidence 0.75 (skipped for a cd and a deletion)"]);
 	assert.deepEqual((await triaged(async () => answers({ read: 1 }), {}, undefined, {}, "rm -f /tmp/x/*.png; ls")).seen, ["triage"]);
+	// So is a shell tool named in tools, and PowerShell's own names in a powershell call.
+	assert.deepEqual((await triaged(async () => answers({ read: 1 }), { tools: ["remote_exec"] }, undefined, {}, ["remote_exec", { command: "cd /srv/app; rm -rf build" }])).seen, ["review:high"]);
+	assert.deepEqual((await triaged(async () => answers({ read: 1 }), {}, undefined, {}, ["powershell", { command: "Set-Location $D; Remove-Item *.png" }])).seen, ["review:high"]);
 	assert.match(clear.verdict.reason, /Routine \(jev-latest: read\)/);
 	// The reason names the likeliest routine kind, not the answer's choice, which can be a risky kind it outweighs.
 	const split = await triaged(async () => ({ ...answers({ edit: 0.2, read: 0.2, connected: 0.2, destroy: 0.2, others: 0.2 }), kind: { choice: "destroy", probabilities: { edit: 0.2, read: 0.2, connected: 0.2, destroy: 0.2, others: 0.2 } } }));

@@ -33,9 +33,9 @@
  * routine with a probability of at least 0.6, and routine rather than its likeliest risk (probability its answer leaves
  * out counts as one) with enough confidence, runs without the reviewer, and anything else, or its failure, goes to the
  * reviewer. It can only let a call run, never block one, and after any call is blocked, the rest of that run goes to
- * the reviewer alone, as does any call over 32,000 characters and any shell command with both a cd and a deletion, since
- * the triage model cleared `cd x; rm ...`, which deletes wherever the shell is if the cd fails. It is off by default. It is called at
- * autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with models.json's credentials: the
+ * the reviewer alone, as does any call over 32,000 characters and any command with both a cd and an rm, since the
+ * triage model cleared `cd x; rm ...`, which deletes wherever the shell is if the cd fails. It is off by default.
+ * It is called at autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with models.json's credentials: the
  * key itself, or "!" and a command that prints it, whose output is kept five minutes.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
  * the call, the verdict, who decided it, and the triage model's answers and tokens and the reviewer's time, tries, and
@@ -777,22 +777,29 @@ export function routine(answers: Answers, confidence: number): boolean {
 }
 
 /**
- * Whether a shell command both changes directory and deletes: a cd, pushd, or PowerShell's Set-Location anywhere, and
- * rm, rmdir, unlink, shred, find -delete, or PowerShell's Remove-Item and its aliases (in PowerShell) anywhere. Jev 1.14 cleared
- * `cd x; rm ...` as routine, which deletes wherever the shell is if the cd fails, and a sentence about it in the kind
- * question did not stop it. Telling `cd x && rm` from `cd x; rm` means reading shell syntax (&&, loops, groups,
- * redirects), so both go to the reviewer: on the review logs of 2026-10-26 to 28 and 2026-11-01 to 02, that was 80 of
- * 1,847 calls, and 7 of the 1,148 the triage model had cleared that were not such a deletion (docs/benchmarks.md).
+ * Whether a shell command both changes directory and removes files: a cd, pushd, or PowerShell's Set-Location anywhere,
+ * and rm, rmdir, unlink, shred, a -delete or --delete flag (find, rsync), or PowerShell's Remove-Item and its aliases
+ * anywhere. Jev 1.14 cleared `cd x; rm ...` as routine, which deletes wherever the shell is if the cd fails, and a
+ * sentence about it in the kind question did not stop it. Telling `cd x && rm` from `cd x; rm` means reading shell
+ * syntax (&&, loops, groups, redirects), so both go to the reviewer: on the review logs of 2026-10-26 to 28 and
+ * 2026-11-01 to 02, that was 81 of 1,847 calls, and 7 of the 1,148 the triage model had cleared that were not such a
+ * deletion (docs/benchmarks.md).
  */
-// ponytail: by words, not by what the shell would do: a deletion only named in text (a heredoc, an echo) goes to the
-// reviewer too, and one inside a script the command runs is not seen.
+// ponytail: by words, not by what the shell would do: text that only names rm (a heredoc, an echo) goes to the reviewer
+// too, and other ways to destroy data (git clean, a script that deletes) are left to the triage model's questions.
 export function cdAndDelete(command: string, powershell = false): boolean {
-	// PowerShell's own names only for PowerShell: in bash, words like del and rd are common in heredoc text.
-	const [cds, dels] = powershell ? ["cd|pushd|sl|set-location|push-location", "rm|rmdir|del|erase|rd|ri|remove-item"] : ["cd|pushd", "rm|rmdir|unlink|shred"];
-	// A deletion may be named by its path (/bin/rm); a cd may not, since ./cd is some other program.
-	const word = (names: string, before: string) => new RegExp(`(?:^|[^\\w$.${before}-])(?:${names})(?=\\s|;|$)`, "im");
-	return word(cds, "\\/").test(command) && (word(dels, "").test(command) || /\s-delete\b/.test(command));
+	const [cd, remove] = powershell ? PS_CD_AND_DELETE : SH_CD_AND_DELETE;
+	return cd.test(command) && (remove.test(command) || /\s--?delete\b/.test(command));
 }
+
+/**
+ * A command name as a word: not part of a longer name, a variable, or a path, and ended by a space, a quote, or an
+ * operator. A deletion may be named by its path (/bin/rm); a cd may not, since ./cd is some other program.
+ */
+const commandWord = (names: string, path = false) => new RegExp(`(?:^|[^\\w$.${path ? "" : "\\/"}-])(?:${names})(?=[\\s;&|()'"<>\\\\]|$)`, "im");
+// PowerShell's own names only for PowerShell: in bash, words like del and rd are common in heredoc text.
+const SH_CD_AND_DELETE = [commandWord("cd|pushd"), commandWord("rm|rmdir|unlink|shred", true)];
+const PS_CD_AND_DELETE = [commandWord("cd|chdir|pushd|sl|set-location|push-location"), commandWord("rm|rmdir|del|erase|rd|ri|remove-item", true)];
 
 /** The routine kind the triage model rated likeliest, to name in the verdict: its "choice" can be a risky kind. */
 function likeliestRoutine(answers: Answers): string {
@@ -813,14 +820,12 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		if (!useTriage) skipped = "skipped after a block";
 		else if (plannedCall(toolName, input).length > TRIAGE_MAX_CALL_CHARS) skipped = "skipped for a large call";
 		triage = skipped === undefined ? triageModel(own) : undefined;
-		if (triage !== undefined && "tools" in triage && !triage.tools.includes(toolName)) {
-			skipped = "skipped for its tool";
-			triage = undefined;
-		}
-		const command = (input as { command?: unknown } | undefined)?.command;
-		if (triage !== undefined && "tools" in triage && (toolName === "bash" || toolName === "powershell") && typeof command === "string" && cdAndDelete(command, toolName === "powershell")) {
-			skipped = "skipped for a cd and a deletion";
-			triage = undefined;
+		if (triage !== undefined && "tools" in triage) {
+			// Any command it judges, so a shell tool named in autoReview.triage.tools is held to the same check.
+			const command = (input as { command?: unknown } | undefined)?.command;
+			if (!triage.tools.includes(toolName)) skipped = "skipped for its tool";
+			else if (typeof command === "string" && cdAndDelete(command, toolName === "powershell")) skipped = "skipped for a cd and a deletion";
+			if (skipped !== undefined) triage = undefined;
 		}
 	} catch (error) {
 		return unreviewed(`Cannot read the reviewer from pi's settings.json: ${error instanceof Error ? error.message : error}`);
