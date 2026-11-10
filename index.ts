@@ -127,7 +127,9 @@ const MAX_TRANSCRIPT_CHARS = 48_000;
 // ponytail: told by how T3 Code words them (read in its source), since pi records them as user messages; a new or
 // reworded notice, and a message another agent sends with t3_thread_send, which has no wording of its own, is trusted.
 const RESTART_NOTE = "Note: the T3 server restarted";
-// Sent as the turn's message.
+// Sent as the turn's message. T3 Code's Resume button sends "Continue where you left off." too, the text T3 Code sent
+// alone after a restart until it gave its own prompt, so a resume the user asked for is a notice as well: it asks for
+// nothing the user's earlier messages did not, and those stay the user's.
 const HOST_NOTICE = new RegExp(`^(Delegated tasks? node:delegated-task|Update on pull request #\\d+ \\(|Continue where you left off\\.|${RESTART_NOTE})`);
 // Put ahead of the turn's message, which follows USER_MESSAGE (T3 Code's withInlineContext). A restart note has no blank
 // line (T3 Code folds each entry onto one), so the first marker after it is T3 Code's; a handoff or a side chat's view
