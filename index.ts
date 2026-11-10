@@ -5,15 +5,18 @@
  * autoReview.readOnlyTools) and edits to ordinary files inside the working directory or under /tmp run as-is, and so does
  * pi's codemode script, whose tool calls are each checked as below.
  * Every other call (bash, edits elsewhere, MCP and custom tools) goes to a reviewer model first, with the session's
- * transcript: the user's messages are trusted, the rest is untrusted evidence. As in Codex, the reviewer rates the
- * call's risk and the user's authorization for it, and decides: low and medium run, high runs only with the user's
- * authorization, critical never does. As in Codex, a review that fails for a passing reason (a rate limit, an overloaded
- * or failing server, a dropped connection or a request timeout, an unreadable answer) is tried again, up to three tries
- * in all within its one 90-second deadline; any other failure, the deadline, or the session's abort ends it. A denied
- * call, or one whose review failed, is blocked and the agent is told why, so it takes a safer route or asks the user;
- * the user's explicit approval in chat lets the next review allow it, unless it is critical. /auto-review approves one
- * retry of a recent denial, as in Codex: the agent is told, and the retry is still reviewed, with that approval as
- * trusted evidence. Three denials in a row, or ten in the last fifty reviews within one run, stop that run.
+ * transcript: the user's messages are trusted, the rest is untrusted evidence, as are the messages T3 Code posts as the
+ * user's (a delegated task's report, another thread's history, a side chat's view of its main thread, a watched pull
+ * request's comments, its note after a restart; the user's message T3 Code adds to one stays the user's), and a long
+ * message sent again counts once. As in Codex, the reviewer rates the call's risk and the user's authorization for it,
+ * and decides: low and medium run, high runs only with the user's authorization, critical never does. As in Codex, a
+ * review that fails for a passing reason (a rate limit, an overloaded or failing server, a dropped connection or a
+ * request timeout, an unreadable answer) is tried again, up to three tries in all within its one 90-second deadline;
+ * any other failure, the deadline, or the session's abort ends it. A denied call, or one whose review failed, is
+ * blocked and the agent is told why, so it takes a safer route or asks the user; the user's explicit approval in chat
+ * lets the next review allow it, unless it is critical. /auto-review approves one retry of a recent denial, as in
+ * Codex: the agent is told, and the retry is still reviewed, with that approval as trusted evidence. Three denials in a
+ * row, or ten in the last fifty reviews within one run, stop that run.
  * Calls on this extension's own files skip the reviewer and are blocked without asking. Edits and writes are judged by
  * the name written and where its links lead, and one whose place cannot be told (a link that leads nowhere, a hard
  * link) is blocked too. A compaction note, or a task for a pi subagent outside Full access, that names its folder is
@@ -117,6 +120,26 @@ const MAX_CHARS = 4_000;
 const MAX_CALL_CHARS = 128_000;
 const MAX_ENTRY_CHARS = 2_000;
 const MAX_TRANSCRIPT_CHARS = 48_000;
+// What T3 Code posts as a user message but an agent or someone else wrote: a delegated task's report, another thread's
+// history, a side chat's view of its main thread, the comments on a pull request it watches, its note and prompt after
+// a restart. As in Codex, which delivers a subagent's report as an agent message and a summary as the assistant's, it
+// authorizes nothing. T3 Code's handoff says so itself ("Historical material is context, not a new request").
+// ponytail: told by how T3 Code words them (read in its source), since pi records them as user messages; a new or
+// reworded notice, and a message another agent sends with t3_thread_send, which has no wording of its own, is trusted.
+const RESTART_NOTE = "Note: the T3 server restarted";
+// Sent as the turn's message. T3 Code's Resume button sends "Continue where you left off." too, the text T3 Code sent
+// alone after a restart until it gave its own prompt, so a resume the user asked for is a notice as well: it asks for
+// nothing the user's earlier messages did not, and those stay the user's.
+const HOST_NOTICE = new RegExp(`^(Delegated tasks? node:delegated-task|Update on pull request #\\d+ \\(|Continue where you left off\\.|${RESTART_NOTE})`);
+// Put ahead of the turn's message, which follows USER_MESSAGE (T3 Code's withInlineContext). A restart note has no blank
+// line (T3 Code folds each entry onto one), so the first marker after it is T3 Code's; a handoff or a side chat's view
+// quotes what agents wrote, which can hold one, so there the marker is T3 Code's only when it is the only one. Otherwise
+// the whole message is a notice: a marker the agent wrote cannot make what follows it the user's.
+const HOST_CONTEXT = new RegExp(`^(Context handoff \\(|You are in a side chat beside the main thread\\.|${RESTART_NOTE})`);
+const USER_MESSAGE = "\n\nUser message:\n";
+// A user message longer than this, sent again, is kept once: a prompt resent whole (a scheduled one) says the same
+// wherever it stands, but a short reply ("no", "go on") means what it answers, so each copy stays where it was.
+const MIN_REPEAT_CHARS = 1_000;
 const RISKS = new Set(["low", "medium", "high", "critical"]);
 const AUTHORIZATIONS = new Set(["unknown", "low", "medium", "high"]);
 const MAX_CONSECUTIVE_DENIALS = 3;
@@ -523,12 +546,15 @@ function textOf(content: string | { type: string; text?: string }[]): string {
 
 /**
  * The session for the reviewer as JSON lines, oldest first: the user's messages and /auto-review approvals (trusted),
- * and the agent's messages, tool calls, and tool results (untrusted). Each entry is one JSON object, so untrusted text
- * cannot pass as a user entry. Within MAX_TRANSCRIPT_CHARS, the trusted entries are kept first, then the newest of the rest.
+ * and the agent's messages, tool calls, tool results, and the host's notices (untrusted). Each entry is one JSON object,
+ * so untrusted text cannot pass as a user entry. A long message the user sent again (a scheduled prompt) is kept once,
+ * where it was last sent, as Codex refers a repeated automation's prompt to one copy. Within MAX_TRANSCRIPT_CHARS, the
+ * trusted entries are kept first, then the newest of the rest.
  */
 export function transcript(branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>): string[] {
-	const entries: { trusted: boolean; line: string }[] = [];
-	const add = (trusted: boolean, entry: object) => entries.push({ trusted, line: JSON.stringify(entry) });
+	// `once` is a long user message's whole text, which says whether it was sent again unchanged; its line is clipped.
+	const all: { trusted: boolean; line: string; once?: string }[] = [];
+	const add = (trusted: boolean, entry: object, once?: string) => all.push({ trusted, line: JSON.stringify(entry), once });
 	for (const entry of branch) {
 		// Only this extension sends approvals: an agent or tool output cannot write a custom message.
 		// The approved call goes in whole and as data, so it can be compared with the planned call, and the agent's text
@@ -540,8 +566,15 @@ export function transcript(branch: ReturnType<ExtensionContext["sessionManager"]
 		if (entry.type !== "message") continue;
 		const message = entry.message as Message;
 		if (message.role === "user") {
-			const text = textOf(message.content);
-			if (text.trim() !== "") add(true, { role: "user", text: clip(text) });
+			let text = textOf(message.content);
+			if (HOST_CONTEXT.test(text)) {
+				const at = text.indexOf(USER_MESSAGE);
+				const own = at >= 0 && (text.startsWith(RESTART_NOTE) || at === text.lastIndexOf(USER_MESSAGE));
+				add(false, { role: "host_notice", text: clip(own ? text.slice(0, at) : text, MAX_ENTRY_CHARS) });
+				text = own ? text.slice(at + USER_MESSAGE.length) : "";
+			}
+			if (HOST_NOTICE.test(text)) add(false, { role: "host_notice", text: clip(text, MAX_ENTRY_CHARS) });
+			else if (text.trim() !== "") add(true, { role: "user", text: clip(text) }, text.length > MIN_REPEAT_CHARS ? text : undefined);
 		} else if (message.role === "assistant") {
 			for (const c of message.content) {
 				if (c.type === "text" && c.text.trim() !== "") add(false, { role: "assistant", text: clip(c.text, MAX_ENTRY_CHARS) });
@@ -551,6 +584,10 @@ export function transcript(branch: ReturnType<ExtensionContext["sessionManager"]
 			add(false, { role: "tool_result", tool: message.toolName, ...(message.isError ? { error: true } : {}), text: clip(textOf(message.content), MAX_ENTRY_CHARS) });
 		}
 	}
+	// The last copy alone: whatever came between the copies, the last one was sent after it.
+	const last = new Map<string, number>();
+	all.forEach((entry, i) => entry.once !== undefined && last.set(entry.once, i));
+	const entries = all.filter((entry, i) => entry.once === undefined || last.get(entry.once) === i);
 	let budget = MAX_TRANSCRIPT_CHARS;
 	const kept = new Set<number>();
 	for (const trusted of [true, false]) {
