@@ -213,6 +213,9 @@ test("transcript passes the host's notices as untrusted, and a long message sent
 		{ role: "user", text: prompt },
 	]);
 	assert.deepEqual(triageState(transcript([user(prompt), user(report), user(prompt)] as any), cwd, "bash", { command: "ls" }).user_messages, [prompt]);
+	// Two long messages that differ only past the clip are not the same message, so both stay.
+	const [specA, specB] = ["a", "b"].map((end) => `${"x".repeat(4_100)}${end}`);
+	assert.equal(transcript([user(specA), user("do not push"), user(specB)] as any).length, 3);
 	const reports = "Delegated tasks node:delegated-task:a, node:delegated-task:b [completed]:\nBoth done.";
 	assert.equal(JSON.parse(transcript([user(reports)] as any)[0]).role, "host_notice");
 	// A watched pull request's comments are someone else's words.

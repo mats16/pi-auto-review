@@ -550,8 +550,9 @@ function textOf(content: string | { type: string; text?: string }[]): string {
  * trusted entries are kept first, then the newest of the rest.
  */
 export function transcript(branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>): string[] {
-	const all: { trusted: boolean; line: string; once?: boolean }[] = [];
-	const add = (trusted: boolean, entry: object, once?: boolean) => all.push({ trusted, line: JSON.stringify(entry), once });
+	// `once` is a long user message's whole text, which says whether it was sent again unchanged; its line is clipped.
+	const all: { trusted: boolean; line: string; once?: string }[] = [];
+	const add = (trusted: boolean, entry: object, once?: string) => all.push({ trusted, line: JSON.stringify(entry), once });
 	for (const entry of branch) {
 		// Only this extension sends approvals: an agent or tool output cannot write a custom message.
 		// The approved call goes in whole and as data, so it can be compared with the planned call, and the agent's text
@@ -571,7 +572,7 @@ export function transcript(branch: ReturnType<ExtensionContext["sessionManager"]
 				text = own ? text.slice(at + USER_MESSAGE.length) : "";
 			}
 			if (HOST_NOTICE.test(text)) add(false, { role: "host_notice", text: clip(text, MAX_ENTRY_CHARS) });
-			else if (text.trim() !== "") add(true, { role: "user", text: clip(text) }, text.length > MIN_REPEAT_CHARS);
+			else if (text.trim() !== "") add(true, { role: "user", text: clip(text) }, text.length > MIN_REPEAT_CHARS ? text : undefined);
 		} else if (message.role === "assistant") {
 			for (const c of message.content) {
 				if (c.type === "text" && c.text.trim() !== "") add(false, { role: "assistant", text: clip(c.text, MAX_ENTRY_CHARS) });
@@ -583,8 +584,8 @@ export function transcript(branch: ReturnType<ExtensionContext["sessionManager"]
 	}
 	// The last copy alone: whatever came between the copies, the last one was sent after it.
 	const last = new Map<string, number>();
-	all.forEach((entry, i) => entry.once && last.set(entry.line, i));
-	const entries = all.filter((entry, i) => !entry.once || last.get(entry.line) === i);
+	all.forEach((entry, i) => entry.once !== undefined && last.set(entry.once, i));
+	const entries = all.filter((entry, i) => entry.once === undefined || last.get(entry.once) === i);
 	let budget = MAX_TRANSCRIPT_CHARS;
 	const kept = new Set<number>();
 	for (const trusted of [true, false]) {
