@@ -851,6 +851,28 @@ function fakeCtx(text: string, seen: string[], hasUI = true, approve = false) {
 	};
 }
 
+test("reviewer output and reasoning share the reserved ceiling without changing the registered model", async () => {
+	for (const modelLimit of [undefined, 8_192, 64_000]) {
+		const model = { contextWindow: 64_000, ...(modelLimit === undefined ? {} : { maxTokens: modelLimit }) };
+		const ctx: any = fakeCtx('{"outcome":"allow"}', []);
+		ctx.model = model;
+		let sent = 0;
+		ctx.modelRegistry.streamSimple = (limited: any, _context: unknown, options: any) => {
+			sent++;
+			const expected = Math.min(modelLimit ?? 16_000, 16_000);
+			assert.equal(options.maxTokens, expected);
+			// Pi's budget-thinking adapters add reasoning, bounded by the submitted model's cap.
+			assert.equal(limited.maxTokens, expected);
+			assert.equal(limited.contextWindow, model.contextWindow);
+			assert.notEqual(limited, model);
+			assert.equal(model.maxTokens, modelLimit);
+			return { result: async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"outcome":"allow"}' }] }) };
+		};
+		assert.equal((await review(ctx, "bash", { command: "x" })).outcome, "allow");
+		assert.equal(sent, 1);
+	}
+});
+
 test("through OpenAI's Responses API, the reviewer's answer is held to the verdict's schema; other APIs answer in text", async () => {
 	const formatOf = async (api: string, samplingParams?: object) => {
 		let sent: any;

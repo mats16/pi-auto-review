@@ -25,7 +25,8 @@
  * call only reads: the agent, told this, picks the read tools if that is all it needs. Calls too large for the
  * reviewer to see whole (over 128,000 characters, or a request, with the transcript, POLICY, and room for its answer,
  * estimated past the reviewer model's own context window) skip it and go to a human, or are blocked when no UI exists;
- * review() itself says so, for a host that calls it.
+ * review() itself says so, for a host that calls it. The reviewer request caps output, including reasoning, at the
+ * reserved 16,000 tokens (or the model's smaller output limit).
  * In T3 Code it reviews only in Supervised and Auto-accept edits, in place of the bridge's own prompts. In Full access
  * everything runs unreviewed, as in Codex, and any other mode keeps the bridge's prompts.
  * The reviewer is PI_AUTO_REVIEW_MODEL, else autoReview.model in pi's user settings.json, else the session's model, run
@@ -1112,13 +1113,17 @@ async function reviewOnce(ctx: ExtensionContext, model: NonNullable<ExtensionCon
 	// An earlier try's tokens must not pass as this one's when this one fails before any.
 	delete record.usage;
 	try {
+		const maxTokens = Math.min(model.maxTokens || REVIEW_OUTPUT_TOKENS, REVIEW_OUTPUT_TOKENS);
+		// Pi adds thinking tokens for some APIs, then clamps them to the model cap; cap a copy to include both.
+		const limited = { ...model, maxTokens };
 		// Pin the effort: left unset, each provider picks its own, and some GPT models then do no reasoning at all.
 		const response = await ctx.modelRegistry
 			.streamSimple(
-				model,
+				limited,
 				{ systemPrompt: POLICY, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
 				{
 					reasoning,
+					maxTokens,
 					signal,
 					// pi merges samplingParams shallowly over the model's, so keep the model's other text settings.
 					...(STRUCTURED_APIS.has(model.api) && { samplingParams: { text: { ...(model.samplingParams?.text as object), format: VERDICT_FORMAT } } }),
