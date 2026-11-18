@@ -1080,6 +1080,82 @@ test("a call too large for the reviewer to see whole goes to the user, never to 
 	assert.deepEqual([fits.blocked, fits.seen], [false, ["review:high"]]);
 });
 
+test("a request past the reviewer's own context window, policy, transcript, and room for its answer counted, goes to the user, never to the reviewer", async () => {
+	// A session model with a million tokens, and autoReview.model naming one with 64,000.
+	const ctxFor = (window: number, seen: string[], messages: string[] = [], hasUI = true) => {
+		const ctx: any = fakeCtx('{"outcome":"allow"}', seen, hasUI);
+		ctx.model = { provider: "big", id: "chat", contextWindow: 1_000_000 };
+		ctx.modelRegistry.find = (provider: string, id: string) => ({ provider, id, contextWindow: window });
+		ctx.sessionManager.getBranch = () => messages.map((text) => ({ type: "message", message: { role: "user", content: text } }));
+		return ctx;
+	};
+	const ascii = { command: `echo ${"a".repeat(60_000)} END` };
+	const japanese = { command: `echo ${"あ".repeat(30_000)}` }; // half as many characters, three bytes each
+	const history = Array.from({ length: 10 }, (_, i) => `${i} ${"x".repeat(3_990)}`);
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { model: "oss/small" } }));
+	try {
+		const run = async (window: number, input: object, messages?: string[]) => {
+			const seen: string[] = [];
+			return [await review(ctxFor(window, seen, messages), "bash", input), seen] as const;
+		};
+		const [fits, sent] = await run(64_000, ascii);
+		assert.deepEqual([fits.outcome, sent], ["allow", ["review:high"]]);
+		const [withHistory, notSent] = await run(64_000, ascii, history);
+		assert.deepEqual([withHistory.tooLarge, withHistory.risk, notSent], [true, "unknown", []]);
+		assert.match(withHistory.reason, /too large to review \(about \d+ tokens .* over the 48000 that oss\/small's 64000-token window/);
+		const [wide, multibyte] = await run(64_000, japanese);
+		assert.deepEqual([wide.tooLarge, multibyte], [true, []]);
+		assert.equal((await run(1_000_000, japanese))[0].outcome, "allow"); // a reviewer with room sees it
+		assert.equal((await run(10_000, { command: "ls" }))[0].tooLarge, true); // too small for POLICY and its answer
+		assert.equal((await run(0, japanese))[0].outcome, "allow"); // no window known: held to the 128,000 characters alone
+		// In the tool_call handler, the user is asked, shown the call whole, or it is blocked without a UI.
+		const seen: string[] = [];
+		const asked = await load("approval-required").tool_call({ toolName: "bash", input: japanese }, ctxFor(64_000, seen));
+		assert.deepEqual([asked?.block, seen], [true, ["confirm"]]);
+		assert.match(confirmed!.at(-1)!, /あ{30000}/);
+		const headless = await load(undefined).tool_call({ toolName: "bash", input: japanese }, ctxFor(64_000, seen, [], false));
+		assert.deepEqual([headless?.block, seen], [true, ["confirm"]]);
+		assert.match(headless!.reason, /too large to review.*Only the user can approve it/);
+	} finally {
+		rmSync(join(agentDir, "settings.json"), { force: true });
+	}
+});
+
+test("reviewer capacity does not prevent routine triage, but bounds nonroutine, failed, and skipped triage fallbacks", async () => {
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoReview: { triage: { enabled: true, model: "jev-latest", endpoint: "https://gw.example/systemone" } } }));
+	const seen: string[] = [];
+	const ctx: any = fakeCtx('{"outcome":"allow"}', seen);
+	ctx.model.contextWindow = 10_000;
+	let requests = 0;
+	let mode = "routine";
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = (async () => {
+		requests++;
+		if (mode === "failure") throw new Error("classifier unavailable");
+		return new Response(JSON.stringify({ answers: answers(mode === "routine" ? { read: 1 } : { destroy: 1 }) }));
+	}) as any;
+	try {
+		const input = { command: "ls" };
+		const cleared = await review(ctx, "bash", input);
+		assert.deepEqual([cleared.outcome, cleared.setup?.by, requests, seen], ["allow", "triage", 2, []]);
+		for (mode of ["nonroutine", "failure"]) {
+			requests = 0;
+			const verdict = await review(ctx, "bash", input);
+			assert.deepEqual([verdict.tooLarge, requests, seen], [true, 2, []], mode);
+			assert.equal(verdict.setup?.triage.startsWith("jev-latest"), true);
+			if (mode === "failure") assert.match(verdict.warning!, /triage model failed.*classifier unavailable/);
+		}
+		requests = 0;
+		mode = "routine";
+		assert.equal((await review(ctx, "bash", input, { triage: false })).tooLarge, true);
+		assert.equal((await review(ctx, "bash", { command: "a".repeat(MAX_CALL_FOR_TEST) })).tooLarge, true);
+		assert.deepEqual([requests, seen], [0, []]);
+	} finally {
+		globalThis.fetch = realFetch;
+		rmSync(join(agentDir, "settings.json"), { force: true });
+	}
+});
+
 test("three denials in a row, or ten of the last fifty reviews, stop the run, as in Codex", async () => {
 	const handlers = load(undefined);
 	const seen: string[] = [];
@@ -1156,6 +1232,19 @@ test("a problem with the triage model is shown once per load, and the reviewer j
 		}
 		assert.deepEqual(seen, ["review:high", "notify", "review:high"]);
 		assert.match(notified!.at(-1)!, /triage model is off: autoReview.triage.endpoint must be set/);
+		// A capacity fallback keeps the same warning, even before manual approval or a headless block.
+		for (const hasUI of [true, false]) {
+			const limited = load(undefined);
+			const calls: string[] = [];
+			for (let i = 0; i < 2; i++) {
+				const ctx: any = fakeCtx('{"outcome":"allow"}', calls, hasUI, true);
+				ctx.model.contextWindow = 10_000;
+				const result = await limited.tool_call({ toolName: "bash", input: { command: "x" } }, ctx);
+				assert.equal(result?.block, hasUI ? undefined : true);
+			}
+			assert.deepEqual(calls, hasUI ? ["notify", "confirm", "confirm"] : ["notify"]);
+			assert.match(notified!.at(-1)!, /triage model is off: autoReview.triage.endpoint must be set/);
+		}
 	} finally {
 		rmSync(join(agentDir, "settings.json"));
 	}
