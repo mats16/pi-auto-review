@@ -30,18 +30,21 @@
  * In T3 Code it reviews only in Supervised and Auto-accept edits, in place of the bridge's own prompts. In Full access
  * everything runs unreviewed, as in Codex, and any other mode keeps the bridge's prompts.
  * The reviewer is PI_AUTO_REVIEW_MODEL, else autoReview.model in pi's user settings.json, else the session's model, run
- * at reasoning effort high unless the one named, or autoReview.effort, gives another. Through OpenAI's Responses API,
- * its answer is held to the verdict's JSON schema; other APIs answer in plain text.
+ * at reasoning effort high unless the one named, or autoReview.effort, gives another. A host that calls review() itself
+ * can pass settings for that call alone (model, effort, triage, log), which win over both; null clears one. Importing
+ * the module registers nothing: only pi calling its default export does. Through OpenAI's Responses API, its answer is
+ * held to the verdict's JSON schema; other APIs answer in plain text.
  * With autoReview.triage turned on, a classifier (the triage model, such as TypeSafe's Jev) sees the user's messages
  * and the call first, for pi's bash, powershell, edit, and write, and the MCP and extension tools named in
  * autoReview.triage.tools; any other tool goes to the reviewer, as Codex leaves MCP calls to its reviewer by default.
  * Whether the call writes a rule to skip asking is asked in a request of its own, about the call alone. A call it finds
  * routine with a probability of at least 0.6, and routine rather than its likeliest risk (probability its answer leaves
- * out counts as one) with enough confidence, runs without the reviewer, and anything else, or its failure, goes to the
- * reviewer. It can only let a call run, never block one, and after any call is blocked, the rest of that run goes to
- * the reviewer alone, as does any call over 32,000 characters and any command that names both a cd and a deletion (rm
- * and its kin, a --delete flag, PowerShell's Remove-Item), since the triage model cleared `cd x; rm ...`, which deletes
- * wherever the shell is if the cd fails. It is off by default.
+ * out counts as one) with enough confidence (autoReview.triage.confidence, else 0.85 for OpenJev and 0.95 for Jev or
+ * any other model), runs without the reviewer, and anything else, or its failure, goes to the reviewer. It can only
+ * let a call run, never block one, and after any call is blocked, the rest of that run goes to the reviewer alone, as
+ * does any call over 32,000 characters and any command that names both a cd and a deletion (rm and its kin, a --delete
+ * flag, PowerShell's Remove-Item), since the triage model cleared `cd x; rm ...`, which deletes wherever the shell is if
+ * the cd fails. It is off by default.
  * It is called at autoReview.triage.endpoint, a System One API, with autoReview.triage.apiKey, not with models.json's
  * credentials: the key itself, or "!" and a command that prints it, whose output is kept five minutes.
  * With autoReview.log set to true, each review appends one JSON line to pi-auto-review.jsonl in pi's agent directory:
@@ -94,10 +97,13 @@ const TRIAGE_TIMEOUT_MS = 10_000;
 // A call over this goes to the reviewer alone, as every call over it went to the user before MAX_CALL_CHARS grew: a small
 // classifier, or an endpoint that clips its input to fit, could see only the routine start of a long call.
 const TRIAGE_MAX_CALL_CHARS = 32_000;
-// Measured on OpenJev's answers to the eval's cases, its history, and cases written after the questions
-// (docs/benchmarks.md): 0.75, routine three times as likely as the likeliest risk, clears nearly as many history
-// reviews as the old rule did and leaves the closest call that should ask 0.5 logit short of clearing. At 0.6 one cleared.
-const TRIAGE_CONFIDENCE = 0.75;
+// The default confidence, by the triage model's ID. On OpenJev's answers to the eval's cases, its history, and cases
+// written after the questions (docs/benchmarks.md), 0.75 left the closest call that should ask 0.5 logit short of
+// clearing and 0.6 cleared one; 0.85 keeps more margin. Jev 1.14 cleared the eval's `cd` deletion below 0.95, so Jev,
+// and a model not known to be OpenJev, gets 0.95.
+// ponytail: by name; a renamed OpenJev gets 0.95 and clears less until confidence is set.
+const OPENJEV = /(?:^|[^a-z0-9])openjev(?:[^a-z0-9]|$)/i;
+const triageConfidence = (model: string) => (OPENJEV.test(model) ? 0.85 : 0.95);
 const TRIAGE_MIN_CONFIDENCE = 0.7;
 // The routine kinds must also reach this, so a risk spread over several kinds, small against the likeliest risk alone,
 // adds up to at most 0.4, as under the old rule's default. Measured as above, it costs one history review in 78.
@@ -630,6 +636,30 @@ function unreviewed(reason: string): Verdict {
  */
 type Settings = { model?: unknown; effort?: unknown; triage?: Record<string, unknown>; log?: unknown; readOnlyTools?: unknown };
 
+/** autoReview.triage, as README describes it. */
+export type TriageSettings = { enabled?: boolean; model?: string; endpoint?: string; apiKey?: string; confidence?: number; tools?: string[] };
+
+/**
+ * A host's settings for one review() call, over PI_AUTO_REVIEW_MODEL and autoReview in pi's user settings.json, which
+ * it reads on every call. A key left out, or undefined, keeps theirs; null clears it to the built-in default (the
+ * session's model, high, triage off, no log), whatever they say. `triage` replaces autoReview.triage whole, and is
+ * checked as that is: a setting it cannot use leaves the call to the reviewer.
+ */
+export type ReviewSettings = {
+	/** "provider/model", with an optional ":level". */
+	model?: string | null;
+	/** Used when the model names no level. */
+	effort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+	triage?: TriageSettings | null;
+	log?: boolean | null;
+};
+
+export type ReviewOptions = {
+	/** false leaves the call to the reviewer even when a triage model is on, as after a block. */
+	triage?: boolean;
+	settings?: ReviewSettings;
+};
+
 // ponytail: mirrors pi's getAgentDir (imports stay type-only); recheck when pi moves its agent directory.
 function agentDir(): string {
 	return process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=$|[/\\])/, homedir()) || join(homedir(), ".pi", "agent");
@@ -655,14 +685,27 @@ function settings(): Settings {
 }
 
 /**
- * The reviewer and its effort, from "provider/model" with an optional ":level": PI_AUTO_REVIEW_MODEL, else
- * autoReview.model in pi's user settings.json, else the session's model. A model without a level gets autoReview.effort,
- * else high.
+ * The settings one review runs with: autoReview from settings.json, its model replaced by PI_AUTO_REVIEW_MODEL when that
+ * is set, and the host's over both, as ReviewSettings says. A new object each call, so concurrent calls share nothing.
  */
-export function reviewer(ctx: ExtensionContext, own: Settings = settings()) {
+export function configured(host: ReviewSettings = {}): Settings {
+	const own: Record<string, unknown> = { ...settings() };
+	if (process.env.PI_AUTO_REVIEW_MODEL) own.model = process.env.PI_AUTO_REVIEW_MODEL;
+	for (const [key, value] of Object.entries(host)) {
+		if (value === null) delete own[key];
+		else if (value !== undefined) own[key] = value;
+	}
+	return own;
+}
+
+/**
+ * The reviewer and its effort, from "provider/model" with an optional ":level": the settings' model (see configured),
+ * else the session's model. A model without a level gets the settings' effort, else high.
+ */
+export function reviewer(ctx: ExtensionContext, own: Settings = configured()) {
 	const effort = own.effort === undefined ? REASONING : String(own.effort);
 	if (!LEVELS.includes(effort)) throw new Error(`autoReview.effort must be one of ${LEVELS.join(", ")}, not ${JSON.stringify(own.effort)}`);
-	const spec = process.env.PI_AUTO_REVIEW_MODEL || (own.model === undefined || own.model === "" ? undefined : String(own.model));
+	const spec = own.model === undefined || own.model === "" ? undefined : String(own.model);
 	if (spec === undefined) return { model: ctx.model, reasoning: effort, spec };
 	// Model IDs can contain ":" (qwen2.5-coder:7b), so only a known level after the last one counts as the effort.
 	const [, name, reasoning = effort] = spec.match(new RegExp(`^(.*?)(?::(${LEVELS.join("|")}))?$`))!;
@@ -686,7 +729,7 @@ export function triageModel(own: Settings = settings()): { spec: string; confide
 	if (triage?.enabled !== true) return undefined;
 	const spec = typeof triage.model === "string" ? triage.model : "";
 	if (spec === "") return { error: `autoReview.triage.model must be the classifier's model ID, not ${JSON.stringify(triage.model)}.` };
-	const confidence = triage.confidence ?? TRIAGE_CONFIDENCE;
+	const confidence = triage.confidence ?? triageConfidence(spec);
 	if (typeof confidence !== "number" || !(confidence >= TRIAGE_MIN_CONFIDENCE && confidence <= 1)) return { error: `autoReview.triage.confidence must be a number from ${TRIAGE_MIN_CONFIDENCE} to 1.` };
 	const { endpoint, apiKey: keySetting } = triage;
 	if (endpoint === undefined || endpoint === "") return { error: "autoReview.triage.endpoint must be set to the full URL of the classifier's System One API." };
@@ -866,8 +909,11 @@ function likeliestRoutine(answers: Answers): string {
 	return ROUTINE_KINDS.reduce((best, k) => ((p[k] ?? 0) > (p[best] ?? 0) ? k : best));
 }
 
-/** Reviews one call. `triage: false` leaves it to the reviewer even when a triage model is on. */
-export async function review(ctx: ExtensionContext, toolName: string, input: unknown, { triage: useTriage = true } = {}): Promise<Verdict> {
+/**
+ * Reviews one call. `triage: false` leaves it to the reviewer even when a triage model is on; `settings` are the host's
+ * for this call alone (ReviewSettings).
+ */
+export async function review(ctx: ExtensionContext, toolName: string, input: unknown, { triage: useTriage = true, settings: host }: ReviewOptions = {}): Promise<Verdict> {
 	// Checked here, so a host that calls review() itself gets the same answer as the tool_call handler.
 	const tooLarge = (why: string): Verdict => ({ ...unreviewed(`This call is too large to review (${why}).`), tooLarge: true });
 	if (plannedCall(toolName, input).length > MAX_CALL_CHARS) return tooLarge(`over ${MAX_CALL_CHARS} characters`);
@@ -877,7 +923,7 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 	let skipped: string | undefined;
 	try {
 		// One read of settings.json, so the reviewer and the triage model come from the same version of it.
-		own = settings();
+		own = configured(host);
 		picked = reviewer(ctx, own);
 		if (!useTriage) skipped = "skipped after a block";
 		else if (plannedCall(toolName, input).length > TRIAGE_MAX_CALL_CHARS) skipped = "skipped for a large call";
@@ -900,7 +946,7 @@ export async function review(ctx: ExtensionContext, toolName: string, input: unk
 		const { model: triageSpec, confidence, endpoint, tools } = own.triage;
 		const named = Array.isArray(tools) && tools.length > 0 ? `, tools ${tools.join(" ")}` : "";
 		// Clipped and on one line, as written by hand it could be anything and would garble the report's list.
-		triageSetup = clip(`${String(triageSpec)}, confidence ${confidence ?? TRIAGE_CONFIDENCE}${named}`.replace(/\s+/g, " "), 200);
+		triageSetup = clip(`${String(triageSpec)}, confidence ${confidence ?? triageConfidence(String(triageSpec))}${named}`.replace(/\s+/g, " "), 200);
 		// The error for a bad endpoint quotes it, so it is masked there too.
 		if (triage !== undefined && "error" in triage) triageSetup += ` (unusable: ${clip(endpoint === undefined ? triage.error : triage.error.replaceAll(JSON.stringify(endpoint), "<endpoint>"), 200)})`;
 		else if (skipped !== undefined) triageSetup += ` (${skipped})`;

@@ -66,6 +66,31 @@ The model can be any model in pi's `models.json`. Only the user-level `settings.
 
 `autoReview.effort` sets the effort (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) when the model setting names none.
 
+### From a host
+
+An app or another extension can call `review()` itself, for the calls it wants reviewed, and pass its own settings for that call. Importing the package registers nothing: only pi loading it as a package calls its default export, which reviews every call. Leave it out of pi's packages if the host wants only `review()`.
+
+```ts
+import { review, type ReviewSettings } from "@mats16/pi-auto-review";
+
+const settings: ReviewSettings = {
+  model: "databricks-oss/system.ai.glm-5-3-flash", // "provider/model", optionally ":level"
+  effort: "high",
+  triage: { enabled: true, model: "system.ai.openjev-qwen35-4b", endpoint, apiKey, tools: [toolName] },
+};
+const verdict = await review(ctx, toolName, input, { settings });
+if (verdict.outcome !== "allow") block(verdict.reason); // also a failed or unreadable review
+```
+
+| Key of `settings` | Left out or `undefined` | `null` |
+|---|---|---|
+| `model` | `PI_AUTO_REVIEW_MODEL`, else `autoReview.model`, else the session's model | The session's model |
+| `effort` | `autoReview.effort`, else `high` (a `:level` on the model wins) | `high` |
+| `triage` | `autoReview.triage` | Off (as is `{ enabled: false }`) |
+| `log` | `autoReview.log` | Off |
+
+Each key the host sets wins over both the variable and `settings.json`, which is read again on every call. `triage` replaces `autoReview.triage` whole, so nothing of the user's (`tools`, `confidence`, ...) leaks into the host's, and is checked the same way: a setting it cannot use leaves the call to the reviewer, with `verdict.warning` saying why. Each call reads its own settings and changes no global state, so concurrent calls do not mix, the next call takes whatever the host passes then, and the host need not set `PI_AUTO_REVIEW_MODEL`. `{ triage: false }` beside `settings` sends the call to the reviewer even with a triage model on, as after a block. Everything else holds as for pi's own calls: a review that fails, times out, or cannot be read is a `deny` with risk `unknown`; a call too large to review is a `deny` with `tooLarge: true`, for the host to ask the user about; `critical` is denied. T3 Code's modes and the own-files rule are the handler's, not `review()`'s.
+
 ### Read-only tools
 
 A tool whose server annotates it `readOnlyHint` runs without review. Some do not pass that on: T3 Code's pi bridge drops it, so its status checks and lists (`t3_thread_wait`, `t3_worktree_status`, ...) are reviewed, each costing a review's wait. Name such tools in `autoReview.readOnlyTools`, and they run like `read`:
@@ -100,7 +125,7 @@ A triage model is a classifier, such as TypeSafe's Jev, that answers in a fracti
       "model": "system.ai.openjev-qwen35-4b",
       "endpoint": "https://<workspace>.cloud.databricks.com/ai-gateway/typesafe/v1/systemone",
       "apiKey": "!databricks auth token --profile <profile> | jq -re .access_token",
-      "confidence": 0.75,
+      "confidence": 0.85,
       "tools": ["mcp__web_search__web_search"]
     }
   }
@@ -113,7 +138,7 @@ A triage model is a classifier, such as TypeSafe's Jev, that answers in a fracti
 | `model` | The classifier's model ID, as its endpoint names it (`system.ai.openjev-qwen35-4b`, `jev-latest`, ...), with no provider: it is sent as is. |
 | `endpoint` | The full `https` URL of the classifier's System One API (plain `http` only for `localhost`, since the API key goes with it), which gets the request as is, so a path that moves (Databricks' is in beta) needs only this setting changed. Other classifier APIs, such as llama.cpp's, are not supported: the questions are written for System One. |
 | `apiKey` | Sent as `Authorization: Bearer <key>`. The key itself, or `!` and a shell command that prints it, such as a CLI that issues short-lived tokens. A command's output is kept for 5 minutes, and dropped early when the endpoint answers 401 or 403; a command that fails, prints nothing, or runs over 10 s is not kept, and the reviewer judges the call (the warning says only how the command ended, not its output, so run it in a shell to see why). Left out, no key is sent. `models.json`'s credentials are not used. |
-| `confidence` | How sure the triage model must be that the call is routine rather than the likeliest risky kind it sees (deleting, installing, posting, ...), from 0.7 to 1 (default `0.75`, routine three times as likely as that risk). Higher sends more calls to the reviewer. At 0.6 a call that should ask was cleared, and 0.7 keeps a margin over it, so a lower value, such as the 0.6 that used to be the default, is refused and the reviewer judges every call. |
+| `confidence` | How sure the triage model must be that the call is routine rather than the likeliest risky kind it sees (deleting, installing, posting, ...), from 0.7 to 1. Left out, it is `0.85` for OpenJev (a `model` with `openjev` as a whole word, such as `system.ai.openjev-qwen35-4b`) and `0.95` for Jev and any other model. Higher sends more calls to the reviewer. At 0.6 a call that should ask was cleared, and 0.7 keeps a margin over it, so a lower value, such as the 0.6 that used to be the default, is refused and the reviewer judges every call. |
 | `tools` | MCP and extension tools the triage model judges too, by name, as in `readOnlyTools`. Left out, it judges only `bash`, `powershell`, `edit`, and `write`. A web search is a good fit: its query leaves the machine, so its server gives no `readOnlyHint`, but it only searches, and a secret in the query is caught by its own question. Leave out tools that post, send, or change things through a service (`slack_write_api_call`), and think twice about `mcp__t3-code__delegate_task`: a task for another provider, or in Full access, runs calls this extension does not check, which only the reviewer weighs. |
 
 With Databricks' OpenJev (Qwen3.5 4B) in front of GLM-5.3-Flash at `high`, on the eval's synthesized patterns and history (2026-10-13), the triage model let no call through that should have asked, at any of these settings:
@@ -121,14 +146,14 @@ With Databricks' OpenJev (Qwen3.5 4B) in front of GLM-5.3-Flash at `high`, on th
 | `confidence` | Synthesized calls cleared without the reviewer | History reviews cleared without the reviewer | History median review |
 |---|---|---|---|
 | 0.7 | 23% | 69% | 0.27 s |
-| 0.75 (default) | 23% | 69% | 0.26 s |
+| 0.75 | 23% | 69% | 0.26 s |
 | 0.8 | 22% | 63% | 0.29 s |
 
-All three keep most reviews under a second. Higher values also move the calls that should ask further from clearing: at the default, the closest of them, on the eval's cases, its history, and cases written after the questions, was half a logit short. At 0.6 one cleared: `cd /tmp/x; rm -f *.pdf *.txt`, with the `cd` unchecked. A secret or a loosened rule is caught by its own question, which clears a call only below 0.2.
+All three keep most reviews under a second. Higher values also move the calls that should ask further from clearing: at 0.75, the default then, the closest of them, on the eval's cases, its history, and cases written after the questions, was half a logit short. At 0.6 one cleared: `cd /tmp/x; rm -f *.pdf *.txt`, with the `cd` unchecked. A secret or a loosened rule is caught by its own question, which clears a call only below 0.2. The default is now 0.85 (2026-11-19), for more margin; 0.85 has not been measured in this table, and clears no more calls than 0.8.
 
-TypeSafe's Jev 1.14 (`system.ai.typesafeai-jev-1-14-0`, 2026-10-28) clears more at the default, but there it cleared that same `cd` deletion, and the eval's version of it, in every run. Stopping the eval's version took 0.95, a value chosen on those same cases, and at 0.95 it clears less of the history than OpenJev. It also hits Databricks' limit on input tokens per minute sooner, and reads less context. See [Jev 1.14](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#jev-114).
+TypeSafe's Jev 1.14 (`system.ai.typesafeai-jev-1-14-0`, 2026-10-28) clears more at 0.75, but there it cleared that same `cd` deletion, and the eval's version of it, in every run. Stopping the eval's version took 0.95, a value chosen on those same cases, so that is its default, and that of any model not named OpenJev; at 0.95 it clears less of the history than OpenJev. It also hits Databricks' limit on input tokens per minute sooner, and reads less context. See [Jev 1.14](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#jev-114).
 
-Since it judges only `bash`, `powershell`, `edit`, `write`, and the tools named in `tools` (2026-10-22), the default clears 15% of the synthesized calls (25% before) and 59% of the history (69% before); see [Which calls the triage model may clear](docs/triage-scope.md#measured). Asking `loosens` about the call alone, the lowest of the calls that write a rule to skip asking rose from 0.41 to 0.62, and the calls that should run cleared went from 30% to 37% ([Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#tools-it-judges-and-loosens-alone)).
+Since it judges only `bash`, `powershell`, `edit`, `write`, and the tools named in `tools` (2026-10-22), 0.75, the default then, clears 15% of the synthesized calls (25% before) and 59% of the history (69% before); see [Which calls the triage model may clear](docs/triage-scope.md#measured). Asking `loosens` about the call alone, the lowest of the calls that write a rule to skip asking rose from 0.41 to 0.62, and the calls that should run cleared went from 30% to 37% ([Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#tools-it-judges-and-loosens-alone)).
 
 [Reviewer benchmarks](https://github.com/mats16/pi-auto-review/blob/main/docs/benchmarks.md#triage-model) has its accuracy, speed, and cost in front of a reviewer.
 
@@ -210,6 +235,8 @@ T3 Code starts pi in **Auto** as it does in Supervised, so pi-auto-review review
 - A `cd` and a deletion in one command are found by their words, not by what the shell would do, since telling `cd x && rm` from `cd x; rm` means reading shell syntax: both go to the reviewer, and so does a command whose heredoc or `echo` only names `rm` or `--delete`, which only loses the triage model's speed-up. For `powershell` and a tool named in `tools`, every string in its input is read this way, with PowerShell's short names too (`sl`, `del`, `rd`, `ri`), so ordinary text that uses them with `cd` also goes to the reviewer. Other ways to change directory (`git -C`, `env -C`) or to destroy data after a `cd`, such as `git clean`, `rsync --remove-source-files`, `trash`, `truncate`, `mv` onto a file, or a script that deletes, are not on the list and are left to the triage model's questions, and so is a name split by quotes (`r''m`), like any other text in a call that misleads it. Other risky steps hidden among routine ones in a compound command are left to the triage model's questions.
 - The triage model sees only your messages and the call, and only the call for whether it loosens a rule. Until a call is blocked in the run, it cannot see what the agent did before, such as a script it wrote that the call runs.
 - The triage model reads the call's text, which the agent wrote, and small classifiers do not treat it as hostile: text in a call can talk it into rating the call routine, and the call then runs without the reviewer. It also sees only your messages and the call, not the agent's words or tool output, so it cannot tell when untrusted content steered the agent; the reviewer can. This is why it is off by default.
+- The default `confidence` is picked by the triage `model`'s name: an OpenJev under a name without `openjev` gets Jev's 0.95, and clears less, until `confidence` is set.
+- The package is TypeScript (`index.ts`) with no build. pi's loader runs it, and so does a bundler; plain Node refuses TypeScript under `node_modules`, so a host outside pi imports it through one of those.
 - The triage model's questions were tuned on the eval's own cases, and the default `confidence` and the 0.2 for its two flags were chosen on its answers to those, the history, and cases written later; few of the calls that should ask came close. Its answers shift with the order of their options and the model's version. Rerun `npm run eval` when you change either.
 - The review log keeps each call as the agent wrote it, and the reviewer's reason, which can quote it, secrets included: delete `pi-auto-review.jsonl` and its `.1` to start over. Only you can read a file it creates. It keeps at most about 10 MB, so older reviews are lost; copy the `.1` away to keep them. If the file cannot be moved to `.1`, reviews stop being logged rather than letting it grow. The call, the reason, and errors keep their first 500 characters, and a line still over 16,000 characters, such as one with a custom triage endpoint's oversized answers, keeps only the verdict. Two pi processes rotating it at the same moment can replace the full `.1` with a nearly empty one. A failed write is skipped without notice. The calls a rule let run are counted in memory and written when the run ends, so a pi process that dies mid-run loses that run's counts. The triage model's tokens are logged but not its cost.
 - The triage model's `apiKey` takes the key itself or a `!` command, not pi's `$NAME` environment variables. A command's key is reused for 5 minutes whatever its expiry, so a token that lasts less (and is not rejected with a 401 or 403) fails triage calls until then; the reviewer judges them. The first call after the 5 minutes waits for the command.

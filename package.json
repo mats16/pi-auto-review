@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "AI auto-review for pi tool calls, after Codex's: a reviewer model approves routine actions and sends risky ones back to the agent.",
   "type": "module",
+  "exports": "./index.ts",
   "license": "MIT",
   "author": "mats16",
   "homepage": "https://github.com/mats16/pi-auto-review#readme",
